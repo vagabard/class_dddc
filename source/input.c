@@ -2327,6 +2327,134 @@ int input_read_parameters_general(struct file_content * pfc,
     class_read_double("bbn_alpha_sensitivity",pth->bbn_alpha_sensitivity);
   }
 
+  /** 11) DDDC model parameters */
+  class_read_double("M0",pba->M0);
+  class_read_double("a_rs",pba->a_rs);
+  class_read_double("k_dil",pba->k_dil);
+  class_read_double("a_min",pba->a_min);
+  class_read_double("a_min_dddc",pba->a_min_dddc);
+  class_read_int("dilation_mode",pba->dilation_mode);
+  class_read_int("integration_mode",pba->integration_mode);
+  class_read_double("n_exp",pba->n_exp);
+  class_read_double("r_s",pba->r_s);
+  class_read_double("R_geom",pba->R_geom);
+  class_read_double("dddc_transition_frac",pba->dddc_transition_frac);
+  class_read_double("dddc_k_blend",pba->dddc_k_blend);
+  class_read_flag("force_amin_to_rs",pba->force_amin_to_rs);
+  class_read_flag("skip_buchdahl_check",pba->skip_buchdahl_check);
+
+  /** 11c) DDDC v2 — pure compaction model (no blending with FLRW)
+   *
+   *  Activated when M0_dddc > 0, R_geom_dddc > 0, and a_sat_dddc > 0.
+   *  Pre-computes H_base_dddc and p_dddc here so background_functions()
+   *  can use them without repeating the unit conversions at every call. */
+  class_read_double("M0_dddc",     pba->M0_dddc);
+  class_read_double("R_geom_dddc", pba->R_geom_dddc);
+  class_read_double("N_min_dddc",  pba->N_min_dddc);
+  class_read_double("a_sat_dddc",  pba->a_sat_dddc);
+  class_read_double("n_exp_dddc",  pba->n_exp_dddc);
+
+  if (pba->M0_dddc > 0. && pba->R_geom_dddc > 0. && pba->a_sat_dddc > 0.) {
+    pba->has_dddc = _TRUE_;
+
+    /* Convert R_geom from Gpc to metres (1 Gpc = 3.08567758e25 m) */
+    double R_geom_m = pba->R_geom_dddc * 3.08567758e25;
+
+    /* Base density: rho0 = M0 / R_geom^3  [kg m^-3] */
+    double rho0_dddc = pba->M0_dddc / (R_geom_m * R_geom_m * R_geom_m);
+
+    /* Base Hubble rate [s^-1]:  H_base = sqrt(8 pi G rho0 / 3)
+     * Uses _G_ [m^3 kg^-1 s^-2] from background.h and _PI_ from common.h */
+    double H_base_si = sqrt(8. * _PI_ * _G_ * rho0_dddc / 3.);
+
+    /* Convert to CLASS units [Mpc^-1]:  H [Mpc^-1] = H [s^-1] * Mpc_over_m / c */
+    pba->H_base_dddc = H_base_si * _Mpc_over_m_ / _c_;
+
+    /* Combined power-law index p = n_exp - 1.5 */
+    pba->p_dddc = pba->n_exp_dddc - 1.5;
+
+    if (pba->background_verbose > 0)
+      printf(" -> DDDC v2 active:"
+             " M0=%e kg, R_geom=%e Gpc, N_min=%e, a_sat=%e, n_exp=%e\n"
+             "            -> H_base=%e Mpc^-1, p=%e\n",
+             pba->M0_dddc, pba->R_geom_dddc, pba->N_min_dddc,
+             pba->a_sat_dddc, pba->n_exp_dddc,
+             pba->H_base_dddc, pba->p_dddc);
+  }
+
+  /** 11e) DDDC v4 — Bounded Elastic Continuum (BEC) model
+   *
+   *  Activated when a_eq_bec > 0 AND P_max_bec > 0.
+   *  STR fluid ODE is integrated in background.c; no derived pre-computes needed here. */
+  class_read_double("a_eq_bec",      pba->a_eq_bec);
+  class_read_double("P_max_bec",     pba->P_max_bec);
+  class_read_double("k_bec",         pba->k_bec);
+  class_read_double("n_bec",         pba->n_bec);
+  class_read_double("Gamma_min_bec", pba->Gamma_min_bec);
+  class_read_double("alpha_bec",     pba->alpha_bec);
+  class_read_double("m_bec",         pba->m_bec);
+
+  if (pba->a_eq_bec > 0. && pba->P_max_bec > 0.) {
+    pba->has_dddc_bec = _TRUE_;
+
+    if (pba->background_verbose > 0)
+      printf(" -> DDDC v4 BEC model active:\n"
+             "    a_eq=%e, P_max=%e Mpc^-2, k=%g, n=%g\n"
+             "    Gamma_min=%g, alpha=%g, m=%g\n",
+             pba->a_eq_bec, pba->P_max_bec, pba->k_bec, pba->n_bec,
+             pba->Gamma_min_bec, pba->alpha_bec, pba->m_bec);
+  }
+
+  /** 11b) DDDC derived parameters: compute r_s from M0 if r_s was not set directly.
+   *
+   *  Formula: r_s = 2*G*M0 / c^2  (Schwarzschild radius)
+   *  M0 is given in solar masses.  The result is converted to Mpc to match the
+   *  unit convention used throughout the background module.
+   *
+   *  Conversion chain:
+   *    M_sun  = 1.989e30 kg
+   *    r_s[m] = 2 * _G_ * M0[M_sun] * M_sun[kg] / _c_^2
+   *    r_s[Mpc] = r_s[m] / _Mpc_over_m_
+   *
+   *  If r_s is also provided directly it takes precedence (M0 is ignored),
+   *  so r_s and M0 are never double-counted. */
+  if (pba->M0 > 0.) {
+    if (pba->r_s > 0.) {
+      /* Both set: r_s takes precedence; warn the user. */
+      if (pba->background_verbose > 0)
+        fprintf(stdout,
+                " -> DDDC: both M0 = %e kg and r_s = %e (Hubble units) were specified."
+                " Using r_s directly; M0 is ignored.\n",
+                pba->M0, pba->r_s);
+    }
+    else {
+      /* Derive r_s from M0 [kg] via the Schwarzschild formula.
+       *
+       * The Interior Schwarzschild formula used throughout background.c is:
+       *   inv_D = 1.5*sqrt(1-r_s/R_geom) - 0.5*sqrt(1-r_s*a^2/R_geom^3)
+       * This expression is dimensionally self-consistent only when r_s, R_geom,
+       * and a are all in the SAME dimensionless units.  Since a is the scale
+       * factor (dimensionless, a_today = 1), r_s and R_geom must also be
+       * dimensionless.  The natural choice is to express them in units of the
+       * Hubble radius c/H0, so:
+       *   r_s [dimensionless] = r_s [Mpc] * H0 [Mpc^{-1}]
+       *                       = r_s [Mpc] / (c/H0) [Mpc]
+       *
+       * M0 is the total mass in kg.  _G_ is in m^3 kg^-1 s^-2, _c_ in m/s.
+       * pba->h is guaranteed to be set from the h/H0 reading above (or from
+       * the input default), so we derive H0 from it directly. */
+      double r_s_meters = 2. * _G_ * pba->M0 / (_c_ * _c_); /* Schwarzschild radius [m]   */
+      double r_s_mpc    = r_s_meters / _Mpc_over_m_;         /* Schwarzschild radius [Mpc] */
+      double H0_mpc     = pba->h * 1.e5 / _c_;               /* H0 [Mpc^{-1}]             */
+      pba->r_s = r_s_mpc * H0_mpc;                           /* dimensionless Hubble units */
+
+      if (pba->background_verbose > 0)
+        fprintf(stdout,
+                " -> DDDC: M0 = %e kg -> r_s = %e Mpc -> r_s = %e (Hubble units, H0 = %e Mpc^-1)\n",
+                pba->M0, r_s_mpc, pba->r_s, H0_mpc);
+    }
+  }
+
   return _SUCCESS_;
 
 }
@@ -2716,12 +2844,21 @@ int input_read_parameters_species(struct file_content * pfc,
   /* Read */
   class_read_double("Omega_k",pba->Omega0_k);
   /* Complete set of parameters */
-  pba->K = -pba->Omega0_k*pow(pba->H0,2);
-  if (pba->K > 0.){
-    pba->sgnK = 1;
+  if (pba->has_dddc == _FALSE_ && pba->has_dddc_bec == _FALSE_) {
+    /* Standard FLRW: curvature from Omega_k */
+    pba->K = -pba->Omega0_k*pow(pba->H0,2);
+    if (pba->K > 0.){
+      pba->sgnK = 1;
+    }
+    else if (pba->K < 0.){
+      pba->sgnK = -1;
+    }
   }
-  else if (pba->K < 0.){
-    pba->sgnK = -1;
+  else {
+    /* DDDC v2: metric is flat by definition of the R_geom parameterisation */
+    pba->K = 0.;
+    pba->Omega0_k = 0.;
+    pba->sgnK = 0;
   }
 
 
@@ -3180,9 +3317,17 @@ int input_read_parameters_species(struct file_content * pfc,
   if (pba->Omega0_cdm < 0.)
     pba->Omega0_cdm = 0.;
 
-  /* avoid Omega0_cdm exactly zero in synchronous gauge */
-  if ((ppt->gauge == synchronous) && (pba->Omega0_cdm < ppr->Omega0_cdm_min_synchronous)) {
+  /* avoid Omega0_cdm exactly zero in synchronous gauge (standard models only) */
+  if ((pba->has_dddc_bec == _FALSE_) &&
+      (ppt->gauge == synchronous) &&
+      (pba->Omega0_cdm < ppr->Omega0_cdm_min_synchronous)) {
     pba->Omega0_cdm = ppr->Omega0_cdm_min_synchronous;
+  }
+
+  /* DDDC-BEC Section 4 bypass: force CDM closure term off.
+   * The BEC STR fluid provides the missing density budget dynamically. */
+  if (pba->has_dddc_bec == _TRUE_) {
+    pba->Omega0_cdm = 0.;
   }
 
   /* At this point all the species should be set, and used for the budget equation below */
@@ -3201,10 +3346,15 @@ int input_read_parameters_species(struct file_content * pfc,
              errmsg,
              errmsg);
   /* Test */
-  class_test((flag1 == _TRUE_) && (flag2 == _TRUE_) && ((flag3 == _FALSE_) || (param3 >= 0.)),
+  class_test((pba->has_dddc_bec == _FALSE_) &&
+             (flag1 == _TRUE_) &&
+             (flag2 == _TRUE_) &&
+             ((flag3 == _FALSE_) || (param3 >= 0.)),
              errmsg,
              "'Omega_Lambda' or 'Omega_fld' must be left unspecified, except if 'Omega_scf' is set and < 0.");
-  class_test(((flag1 == _FALSE_)||(flag2 == _FALSE_)) && ((flag3 == _TRUE_) && (param3 < 0.)),
+  class_test((pba->has_dddc_bec == _FALSE_) &&
+             ((flag1 == _FALSE_)||(flag2 == _FALSE_)) &&
+             ((flag3 == _TRUE_) && (param3 < 0.)),
              errmsg,
              "You have entered 'Omega_scf' < 0 , so you have to specify both 'Omega_lambda' and 'Omega_fld'.");
   /* Complete set of parameters
@@ -3240,25 +3390,55 @@ int input_read_parameters_species(struct file_content * pfc,
     Omega_tot += pba->Omega0_scf;
   }
   /* Step 2 */
-  if (flag1 == _FALSE_) {
-    /* Fill with Lambda */
-    pba->Omega0_lambda= 1. - pba->Omega0_k - Omega_tot;
-    if (input_verbose > 0){
-      printf(" -> matched budget equations by adjusting Omega_Lambda = %g\n",pba->Omega0_lambda);
+  if (pba->has_dddc == _FALSE_ && pba->has_dddc_bec == _FALSE_) {
+    /* Standard FLRW: fill an unspecified dark-energy component to satisfy Omega_tot = 1 */
+    if (flag1 == _FALSE_) {
+      /* Fill with Lambda */
+      pba->Omega0_lambda= 1. - pba->Omega0_k - Omega_tot;
+      if (input_verbose > 0){
+        printf(" -> matched budget equations by adjusting Omega_Lambda = %g\n",pba->Omega0_lambda);
+      }
+    }
+    else if (flag2 == _FALSE_) {
+      /* Fill up with fluid */
+      pba->Omega0_fld = 1. - pba->Omega0_k - Omega_tot;
+      if (input_verbose > 0){
+        printf(" -> matched budget equations by adjusting Omega_fld = %g\n",pba->Omega0_fld);
+      }
+    }
+    else if ((flag3 == _TRUE_) && (param3 < 0.)){
+      /* Fill up with scalar field */
+      pba->Omega0_scf = 1. - pba->Omega0_k - Omega_tot;
+      if (input_verbose > 0){
+        printf(" -> matched budget equations by adjusting Omega_scf = %g\n",pba->Omega0_scf);
+      }
     }
   }
-  else if (flag2 == _FALSE_) {
-    /* Fill up with fluid */
-    pba->Omega0_fld = 1. - pba->Omega0_k - Omega_tot;
-    if (input_verbose > 0){
-      printf(" -> matched budget equations by adjusting Omega_fld = %g\n",pba->Omega0_fld);
+  else if (pba->has_dddc_bec == _TRUE_) {
+    /* DDDC v4 BEC: bypass FLRW sum-rule closure terms.
+     * Force Lambda = 0 and leave closure to rho_STR dynamics. */
+    pba->Omega0_lambda = 0.;
+    if (flag2 == _FALSE_) {
+      pba->Omega0_fld = 0.;
+    }
+    if (input_verbose > 0) {
+      printf(" -> DDDC v4 BEC: bypassing FLRW Omega sum rule; forcing Omega_cdm = 0 and Omega_Lambda = 0.\n");
     }
   }
-  else if ((flag3 == _TRUE_) && (param3 < 0.)){
-    /* Fill up with scalar field */
-    pba->Omega0_scf = 1. - pba->Omega0_k - Omega_tot;
-    if (input_verbose > 0){
-      printf(" -> matched budget equations by adjusting Omega_scf = %g\n",pba->Omega0_scf);
+  else {
+    /* DDDC v2: H is driven by the compaction density, not the Friedmann sum.
+     * The metric is flat by definition (K = 0 already set above).
+     * Do NOT fill any component — the Omega sum need not equal 1.
+     * Lambda is set to zero unless the user explicitly provided it. */
+    if (flag1 == _FALSE_) {
+      pba->Omega0_lambda = 0.;
+    }
+    if (flag2 == _FALSE_) {
+      pba->Omega0_fld = 0.;
+    }
+    if (input_verbose > 0) {
+      printf(" -> DDDC v2: bypassing FLRW Omega sum rule; K = 0, Omega_Lambda = %g\n",
+             pba->Omega0_lambda);
     }
   }
 
@@ -5807,6 +5987,43 @@ int input_default_params(struct background *pba,
   pba->varconst_me = 1.;
   pth->bbn_alpha_sensitivity = 1.;
   pba->varconst_transition_redshift = 50.;
+
+  /** 11) DDDC model parameters */
+  pba->M0 = 0.0;            /* total mass [solar masses]; 0 = not set, use r_s directly */
+  pba->a_rs = 0.0;
+  pba->k_dil = 0.0;
+  pba->a_min = 0.0;
+  pba->a_min_dddc = 0.0;
+  pba->dilation_mode = 1;
+  pba->integration_mode = 0;
+  pba->n_exp = 1.0;
+  pba->r_s = 0.0;
+  pba->R_geom = 0.0;
+  pba->dddc_transition_frac = 0.3;
+  pba->dddc_k_blend = 0.0;       /* 0 = use dddc_transition_frac; >0 overrides with 1/k_blend */
+  pba->force_amin_to_rs = _FALSE_;
+  pba->skip_buchdahl_check = _FALSE_; /* _TRUE_ suppresses R_geom > r_s and Buchdahl checks */
+  pba->use_soft_transition = _FALSE_; /* computed in background_checks(), not user-set */
+
+  /** 11c) DDDC v2 (pure compaction model) — defaults */
+  pba->M0_dddc       = 0.0;
+  pba->R_geom_dddc   = 0.0;
+  pba->N_min_dddc    = 0.0;
+  pba->a_sat_dddc    = 0.0;
+  pba->n_exp_dddc    = 1.0;
+  pba->has_dddc      = _FALSE_;
+  pba->H_base_dddc   = 0.0;
+  pba->p_dddc        = 0.0;
+
+  /** 11e) DDDC v4 BEC model — defaults */
+  pba->a_eq_bec      = 0.0;
+  pba->P_max_bec     = 0.0;
+  pba->k_bec         = 1.0;
+  pba->n_bec         = 1.0;
+  pba->Gamma_min_bec = 0.0;
+  pba->alpha_bec     = 0.0;
+  pba->m_bec         = 1.0;
+  pba->has_dddc_bec  = _FALSE_;
 
   /**
    * Default to input_read_parameters_species

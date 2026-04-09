@@ -71,6 +71,10 @@ cdef extern from "class.h":
         int index_bg_rho_cdm
         int index_bg_rho_ncdm1
         int index_bg_rho_crit
+        double a_rs
+        double k_dil
+        double a_min
+        int dilation_mode
         short has_cdm
         short  has_ncdm
         int N_ncdm
@@ -478,6 +482,10 @@ cdef extern from "class.h":
     int background_at_tau(void* pba, double tau, int return_format, int inter_mode, int * last_index, double *pvecback)
     int background_output_titles(void * pba, char titles[8000])
     int background_output_data(void *pba, int number_of_titles, double *data)
+
+    int background_dilation_factor(void* pba, double a, double * D, ErrorMsg error_message)
+    int background_dddc_z_of_a(void* pba, double a, double * z_obs, ErrorMsg error_message)
+    int background_dddc_a_of_z(void* pba, double z_obs, double * a, ErrorMsg error_message)
 
     int thermodynamics_at_z(void * pba, void * pth, double z, int inter_mode, int * last_index, double *pvecback, double *pvecthermo)
     int thermodynamics_output_titles(void * pba, void *pth, char titles[8000])

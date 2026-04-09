@@ -1722,8 +1722,9 @@ int fourier_init(
                          pba->error_message,
                          pfo->error_message);
               a = pvecback[pba->index_bg_a];
-              /* redshift (remeber that a in the code stands for (a/a_0)) */
-              z = 1./a-1.;
+              /* Report DDDC observed redshift when active, otherwise standard z = 1/a - 1. */
+              if (background_dddc_z_of_a(pba, a, &z, pfo->error_message) != _SUCCESS_)
+                z = 1./a - 1.;
               fprintf(stdout,
                       " -> [WARNING:] Non-linear corrections could not be computed at redshift z=%5.2f and higher.\n    This is because k_max is too small for the algorithm (Halofit or HMcode) to be able to compute the scale k_NL at this redshift.\n    If non-linear corrections at such high redshift really matter for you,\n    just try to increase the precision parameter nonlinear_min_k_max (currently at %e) until k_NL can be computed at the desired z.\n",z,ppr->nonlinear_min_k_max);
 

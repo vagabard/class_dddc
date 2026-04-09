@@ -113,6 +113,289 @@
  */
 
 #include "background.h"
+#include <math.h>  /* sqrt */
+
+/**
+ * DDDC soft-cap guardrails — C-infinity smooth regularizations replacing
+ * hard MAX/MIN clips.  All three functions have continuous derivatives
+ * everywhere, so the ODE Jacobian never sees a "kink."
+ * Edit the epsilon/cap constants here; every call site updates.
+ *
+ * DDDC_TC_EPS:      offset inside the a-a_min root that softens the infinite
+ *                   slope of tc(a) at a=a_min.
+ *                   tc_soft = ((sqrt((a-a_min)^2 + eps^2)) / k_dil)^(1/n)
+ *                   For a >> a_min: tc_soft ≈ tc_raw.
+ *                   At a = a_min: tc_soft ≈ (eps/k_dil)^(1/n)  > 0.
+ *
+ * DDDC_H_LIMIT:     asymptotic ceiling for H via tanh saturation.
+ *                   H_soft = H_limit * tanh(H_raw / H_limit)
+ *                   For H << H_limit: H_soft ≈ H_raw  (tanh x ≈ x).
+ *                   As H → ∞:        H_soft → H_limit (asymptotic, no kink).
+ *
+ * DDDC_INV_D_MIN:   hyperbolic floor on 1/D (already smooth, unchanged).
+ *                   inv_D_soft = sqrt(inv_D_raw^2 + eps_D^2)
+ */
+static double const DDDC_H_LIMIT   = 100000.0;  /* tanh ceiling for H [Mpc^-1]  */
+static double const DDDC_INV_D_MIN = 1e-5;      /* floor on 1/D  → max D = 1e5  */
+static double const DDDC_TC_EPS    = 1e-5;       /* soft floor for a - a_min      */
+static double const BEC_RHO_EFF_EPS = 1e-30;    /* soft positivity floor for rho_tot-K/a^2 */
+static double const BEC_H_FLOOR_FRAC = 1e-3;    /* minimum BEC H as fraction of FLRW H */
+
+/* Soft floor for tc: replaces MAX(a-a_min, 0) with sqrt((a-a_min)^2 + eps^2).
+   Derivative w.r.t. a is (a-a_min)/sqrt(...) — smooth through a=a_min. */
+static inline double dddc_soft_delta_a(double delta_a) {
+  return sqrt(delta_a * delta_a + DDDC_TC_EPS * DDDC_TC_EPS);
+}
+
+/* Soft ceiling for H: tanh saturation.  H_soft → H_raw for H_raw << cap;
+   H_soft → H_cap asymptotically.  All derivatives are continuous. */
+static inline double dddc_soft_H(double H_raw) {
+  return DDDC_H_LIMIT * tanh(H_raw / DDDC_H_LIMIT);
+}
+
+/* Hyperbolic soft floor for inv_D (unchanged form). */
+static inline double dddc_regularize_inv_D(double inv_D_raw) {
+  return sqrt(inv_D_raw * inv_D_raw + DDDC_INV_D_MIN * DDDC_INV_D_MIN);
+}
+
+/* Soft maximum for BEC dilation factor Gamma(a).
+ * Replaces fmax(Gamma_pow, Gamma_min) with a C-infinity smooth equivalent:
+ *   bec_soft_gamma(x, m) = sqrt(x^2 + m^2)
+ * which satisfies: ≈ m for x << m (at the floor), ≈ x for x >> m (power-law regime).
+ * The sharp kink in fmax at x = m forces NDF15 to take machine-precision steps there;
+ * this smooth version eliminates that C1-discontinuity. */
+static inline double bec_soft_gamma(double gamma_pow, double gamma_min) {
+  return sqrt(gamma_pow * gamma_pow + gamma_min * gamma_min);
+}
+
+/* Soft minimum of (g, 1.0) for the BEC ceiling Gamma <= 1.
+ * Replaces fmin(g, 1.0) with a C-infinity smooth equivalent:
+ *   bec_soft_ceil(g, eps) = (g + 1 - sqrt((g-1)^2 + eps^2)) / 2
+ * which satisfies: ≈ g for g << 1 (pass-through), ≈ 1 for g >> 1 (ceiling).
+ * The sharp kink in fmin at g = 1 causes NDF15 to take machine-precision steps
+ * near the crossover; this smooth version eliminates that C1-discontinuity.
+ * Keep eps very small: large eps can drive this expression slightly negative
+ * when g << 1, which is unphysical for a dilation factor. */
+#define GAMMA_CEIL_EPS 1e-6
+static inline double bec_soft_ceil(double g) {
+  double d, root, value;
+
+  /* Guard against inf-inf cancellation in the large-g tail:
+   * for g >> 1, 0.5*(g+1-sqrt((g-1)^2+eps^2)) is mathematically ~1 but can
+   * evaluate to NaN numerically if both terms overflow to +inf. */
+  if (!isfinite(g)) {
+    return 1.0;
+  }
+
+  d = g - 1.0;
+  root = sqrt(d * d + GAMMA_CEIL_EPS * GAMMA_CEIL_EPS);
+
+  if (d >= 0.0) {
+    /* Stable form in the cancellation-prone branch:
+     * value = 1 - 0.5*(root-d), with (root-d)=eps^2/(root+d). */
+    double denom = root + d;
+    if (denom > 0.0) {
+      value = 1.0 - 0.5 * (GAMMA_CEIL_EPS * GAMMA_CEIL_EPS) / denom;
+    }
+    else {
+      value = 1.0;
+    }
+  }
+  else {
+    value = 0.5 * (g + 1.0 - root);
+  }
+
+  return fmax(value, 1e-30);
+}
+
+/* Smooth C-infinity approximation of max(x,0). */
+static inline double bec_soft_positive(double x) {
+  return 0.5 * (x + sqrt(x * x + BEC_RHO_EFF_EPS * BEC_RHO_EFF_EPS));
+}
+
+/* Smooth C-infinity approximation of max(x,y). */
+static inline double bec_soft_max(double x, double y, double eps) {
+  double d = x - y;
+  return 0.5 * (x + y + sqrt(d * d + eps * eps));
+}
+
+/* Raw BEC dilation model before a=1 normalization. */
+static inline double bec_gamma_raw(struct background * pba, double a) {
+  double ratio_bec = (pba->a_eq_bec > 0.) ? (a / pba->a_eq_bec) : 1.0;
+  double gamma_pow = pow(ratio_bec, pba->alpha_bec) * pow(a, pba->m_bec);
+  return bec_soft_ceil(bec_soft_gamma(gamma_pow, pba->Gamma_min_bec));
+}
+
+/* Effective BEC dilation normalized so Gamma_eff(a=1)=1 exactly. */
+static inline double bec_gamma_eff(struct background * pba, double a) {
+  double gamma_today = bec_gamma_raw(pba, 1.0);
+  return bec_gamma_raw(pba, a) / fmax(gamma_today, 1e-30);
+}
+
+/* Numerically robust d(ln Gamma_raw)/d(ln a).
+ * Central differencing avoids analytic inf/inf forms in the saturated regime. */
+static inline double bec_dln_gamma_dlna(struct background * pba, double a) {
+  const double dlna = 1e-6;
+  double a_plus = a * exp(dlna);
+  double a_minus = a * exp(-dlna);
+  double g_plus, g_minus, deriv;
+
+  if (a_minus <= 0.0) {
+    a_minus = a * (1.0 - dlna);
+  }
+  if (a_minus <= 0.0) {
+    a_minus = a;
+  }
+
+  g_plus = bec_gamma_raw(pba, a_plus);
+  g_minus = bec_gamma_raw(pba, a_minus);
+
+  deriv = (log(fmax(g_plus, 1e-300)) - log(fmax(g_minus, 1e-300))) / (2.0 * dlna);
+
+  if (!isfinite(deriv)) {
+    return 0.0;
+  }
+
+  return deriv;
+}
+
+/* Helper to calculate H_blended for DDDC models.
+   Encapsulates the blending between FLRW and DDDC power-law Hubble rates. */
+static inline double background_dddc_blended_H(struct background * pba, double a, double H_flrw) {
+
+  // DDDC Math
+  double delta_a = dddc_soft_delta_a(a - pba->a_min_dddc);
+  double tc = pow(delta_a / pba->k_dil, 1.0 / pba->n_exp);
+
+  /* fmax clamps mirror background_dilation_factor so NaN never propagates
+   * when skip_buchdahl_check is active and r_s > R_geom. */
+  double arg_boundary = fmax(1.0 - pba->r_s / pba->R_geom, 0.0);
+  double arg_internal = fmax(1.0 - (pba->r_s * a * a) / pow(pba->R_geom, 3.0), 0.0);
+  double term_boundary = 1.5 * sqrt(arg_boundary);
+  double term_internal = 0.5 * sqrt(arg_internal);
+  double inv_D_raw = term_boundary - term_internal;
+
+  double da_dtc = pba->n_exp * pba->k_dil * pow(tc, pba->n_exp - 1.0);
+  double H_coord = da_dtc / a;
+  /* Use the regularised (always-positive) inv_D so H_coord/inv_D is never NaN. */
+  double inv_D_reg = dddc_regularize_inv_D(inv_D_raw);
+  double H_raw = H_coord / fmax(inv_D_reg, 1e-30);
+
+  // Centralized caps and units
+  double H_safe = dddc_soft_H(H_raw);
+  double c_km_s = _c_ / 1000.0;
+  H_safe /= c_km_s;
+
+  /* Blending — width controls how gradually H transitions from FLRW to DDDC.
+   * Too narrow (< 0.1*a_min_dddc) causes ODE stiffness in perturbation solver.
+   * dddc_k_blend > 0 gives direct control: transition_width = 1/k_blend.
+   * Otherwise fall back to the fractional width dddc_transition_frac. */
+  double transition_width;
+  if (pba->dddc_k_blend > 0.) {
+    transition_width = 1.0 / pba->dddc_k_blend;
+  } else {
+    transition_width = pba->a_min_dddc * pba->dddc_transition_frac;
+    if (transition_width < 1e-10) transition_width = pba->a_min_dddc * 0.3;
+  }
+
+  /* Normalized blending weight: zero exactly at a=0, one asymptotically.
+   *
+   * The raw sigmoid 0.5*(1+tanh((a-a_min)/w)) evaluates to a small but
+   * non-zero value at a=0 (≈ 0.001 for the default transition width).
+   * This tiny H_dddc contribution at a_ini makes H_blended < H_flrw, so
+   * rho_crit = H_blended^2 < H_flrw^2 and Omega_r = rho_r/rho_crit > 1,
+   * failing CLASS's radiation-domination check at the start of integration.
+   *
+   * Fix: subtract the a=0 baseline and rescale to [0,1]:
+   *   weight_raw(a=0) = 0.5*(1 - tanh(a_min/w))  =: w0
+   *   weight_norm(a)  = max(0, (weight_raw - w0)/(1 - w0))
+   * This preserves the sigmoid shape (the correction is O(w0) ~ 0.001) and
+   * guarantees H_blended = H_flrw at a_ini → Omega_r = 1 exactly. */
+  double weight_raw  = 0.5 * (1.0 + tanh((a - pba->a_min_dddc) / transition_width));
+  double weight_a0   = 0.5 * (1.0 - tanh(pba->a_min_dddc / transition_width));
+  double weight_dddc, weight_flrw;
+  if (weight_raw <= weight_a0) {
+    /* Below the a=0 baseline: pure FLRW, no DDDC contribution. */
+    return H_flrw;
+  }
+  weight_dddc = (weight_raw - weight_a0) / (1.0 - weight_a0);
+  weight_flrw = 1.0 - weight_dddc;
+
+  return (weight_flrw * H_flrw) + (weight_dddc * H_safe);
+}
+
+/* BEC debug logger with bounded history.
+ * Keeps the latest N BEC states and only dumps them when an anomaly starts,
+ * avoiding per-step stderr floods while preserving local context. */
+#define BEC_DEBUG_HISTORY_LEN 20
+#define BEC_DEBUG_LINE_LEN 180
+#define BEC_DEBUG_PRINT_EVERY 1000
+static void background_bec_debug_log(double a,
+                                     double H,
+                                     double rho_str,
+                                     double dy_rho_str,
+                                     double P_max,
+                                     int anomaly) {
+
+  static char history[BEC_DEBUG_HISTORY_LEN][BEC_DEBUG_LINE_LEN];
+  static int history_head = 0;
+  static int history_count = 0;
+  static int anomaly_streak = 0;
+  static double previous_a = -1.0;
+  int i;
+  int start;
+  int slot;
+
+  if (previous_a > 0.0 && a < previous_a * 0.1) {
+    history_head = 0;
+    history_count = 0;
+    anomaly_streak = 0;
+  }
+  previous_a = a;
+
+  if (anomaly == _TRUE_) {
+    anomaly_streak++;
+
+    if (anomaly_streak == 1) {
+      fprintf(stderr,
+              "DEBUG BEC anomaly started: dumping last %d BEC states before trigger\n",
+              history_count);
+
+      start = (history_head - history_count + BEC_DEBUG_HISTORY_LEN) % BEC_DEBUG_HISTORY_LEN;
+      for (i = 0; i < history_count; i++) {
+        slot = (start + i) % BEC_DEBUG_HISTORY_LEN;
+        fprintf(stderr, "  %s\n", history[slot]);
+      }
+
+      fprintf(stderr,
+              "DEBUG BEC NaN/Inf: a=%e H=%e rho_str=%e dy_rho_str=%e P_max=%e\n",
+              a, H, rho_str, dy_rho_str, P_max);
+      fflush(stderr);
+    }
+    else if ((anomaly_streak % BEC_DEBUG_PRINT_EVERY) == 0) {
+      fprintf(stderr,
+              "DEBUG BEC NaN/Inf ongoing: streak=%d a=%e H=%e rho_str=%e dy_rho_str=%e P_max=%e\n",
+              anomaly_streak, a, H, rho_str, dy_rho_str, P_max);
+      fflush(stderr);
+    }
+  }
+  else if (anomaly_streak > 0) {
+    fprintf(stderr,
+            "DEBUG BEC NaN/Inf recovered after %d anomalous steps\n",
+            anomaly_streak);
+    fflush(stderr);
+    anomaly_streak = 0;
+  }
+
+  snprintf(history[history_head],
+           BEC_DEBUG_LINE_LEN,
+           "DEBUG BEC trace: a=%e H=%e rho_str=%e dy_rho_str=%e P_max=%e",
+           a, H, rho_str, dy_rho_str, P_max);
+  history_head = (history_head + 1) % BEC_DEBUG_HISTORY_LEN;
+  if (history_count < BEC_DEBUG_HISTORY_LEN) {
+    history_count++;
+  }
+}
 
 /**
  * Background quantities at given redshift z.
@@ -138,6 +421,17 @@ int background_at_z(
                     double * pvecback /* vector with argument pvecback[index_bg] (must be already allocated with a size compatible with return_format) */
                     ) {
 
+  /* DEBUG: over-call trap — excessive calls indicate a hung ODE solver */
+  // {
+  //   static long bg_at_z_calls = 0;
+  //   bg_at_z_calls++;
+  //   if (bg_at_z_calls % 100000 == 0) {
+  //     printf("DEBUG: background_at_z called %ld times. Requested z = %e\n",
+  //            bg_at_z_calls, z);
+  //     fflush(stdout);
+  //   }
+  // }
+
   /** Summary: */
 
   /** - define local variables */
@@ -148,12 +442,41 @@ int background_at_z(
   /* log(a) (in fact, given our normalisation conventions, this is log(a/a_0)) */
   double loga;
 
-  /** - check that log(a) = log(1/(1+z)) = -log(1+z) is in the pre-computed range */
-  loga = -log(1+z);
+  /** - compute log(a) from z: use DDDC inversion if dilation is active */
+  {
+    double a_from_z;
+    double z_query = z;
+    /* DDDC: the thermodynamics ODE can probe z < 0 on trial steps (a > 1).
+     * Clamp to z=0 (return a=1) — quantities at a=1 are a valid extrapolation. */
+    if (pba->r_s > 0. && z_query < 0.) {
+      z_query = 0.;
+    }
+    class_call(background_dddc_a_of_z(pba, z_query, &a_from_z, pba->error_message),
+               pba->error_message,
+               pba->error_message);
+    loga = log(a_from_z);
+  }
 
-  class_test(loga < pba->loga_table[0],
-             pba->error_message,
-             "out of range: a/a_0 = %e < a_min/a_0 = %e, you should decrease the precision parameter a_ini_over_a_today_default\n",1./(1.+z),exp(pba->loga_table[0]));
+  /* Clamp loga to table floor when DDDC is active (r_s > 0) or when using
+   * coordinate-time integration.  In DDDC mode the observable redshift
+   * z_obs = D(a)/D(1)/a − 1 is not identical to z_FLRW = 1/a − 1, so the
+   * inverse mapping background_dddc_a_of_z can return a value that lands
+   * marginally below a_ini (e.g. when thermodynamics queries tau_star right
+   * at the edge of the background table).  Clamping is safe: background
+   * quantities at a_ini are radiation-dominated FLRW, which is an accurate
+   * approximation for any epoch this close to the start of integration.
+   *
+   */
+  if (pba->integration_mode == 1 || pba->r_s > 0.) {
+    if (loga < pba->loga_table[0]) {
+      loga = pba->loga_table[0];
+    }
+  }
+  else {
+    class_test(loga < pba->loga_table[0],
+               pba->error_message,
+               "out of range: a/a_0 = %e < a_min/a_0 = %e, you should decrease the precision parameter a_ini_over_a_today_default\n",1./(1.+z),exp(pba->loga_table[0]));
+  }
 
   class_test(loga > pba->loga_table[pba->bt_size-1],
              pba->error_message,
@@ -242,6 +565,16 @@ int background_at_tau(
   double z;
 
   /** - Get current redshift */
+  if (tau < pba->tau_table[0]) {
+    if (pba->r_s > 0. || pba->has_dddc == _TRUE_) {
+      tau = pba->tau_table[0];
+    }
+  }
+  if (tau > pba->tau_table[pba->bt_size-1]) {
+    if (pba->r_s > 0. || pba->has_dddc == _TRUE_) {
+      tau = pba->tau_table[pba->bt_size - 1];
+    }
+  }
   class_call(background_z_of_tau(pba,tau,&z),
              pba->error_message,
              pba->error_message);
@@ -279,13 +612,31 @@ int background_tau_of_z(
   int last_index;
 
   /** - check that \f$ z \f$ is in the pre-computed range */
-  class_test(z < pba->z_table[pba->bt_size-1],
-             pba->error_message,
-             "out of range: z=%e < z_min=%e\n",z,pba->z_table[pba->bt_size-1]);
 
-  class_test(z > pba->z_table[0],
-             pba->error_message,
-             "out of range: z=%e > z_max=%e\n",z,pba->z_table[0]);
+  if (z < pba->z_table[pba->bt_size-1]) {
+    if (pba->r_s > 0. || pba->has_dddc == _TRUE_) {
+      /* z_table[bt_size-1] should be 0 at a=1; if it isn't, there is a
+       * Gamma_today normalization bug.  Log a warning and clamp. */
+      if (pba->background_verbose > 0 && pba->z_table[pba->bt_size-1] > 0.01) {
+        printf("DDDC WARNING: z_table[bt_size-1]=%e (expected ~0). "
+               "Gamma_today normalization error.\n",
+               pba->z_table[pba->bt_size-1]);
+      }
+      z = pba->z_table[pba->bt_size - 1];
+    } else {
+      class_test(1, pba->error_message,
+                 "out of range: z=%e < z_min=%e\n", z, pba->z_table[pba->bt_size-1]);
+    }
+  }
+
+  if (z > pba->z_table[0]) {
+    if (pba->r_s > 0. || pba->has_dddc == _TRUE_) {
+      z = pba->z_table[0];
+    } else {
+      class_test(1, pba->error_message,
+                 "out of range: z=%e > z_max=%e\n", z, pba->z_table[0]);
+    }
+  }
 
   /** - interpolate from pre-computed table with array_interpolate() */
   class_call(array_interpolate_spline(
@@ -329,13 +680,23 @@ int background_z_of_tau(
   int last_index;
 
   /** - check that \f$ tau \f$ is in the pre-computed range */
-  class_test(tau < pba->tau_table[0],
-             pba->error_message,
-             "out of range: tau=%e < tau_min=%e\n",tau,pba->tau_table[0]);
+  if (tau < pba->tau_table[0]) {
+    if (pba->r_s > 0. || pba->has_dddc == _TRUE_) {
+      tau = pba->tau_table[0];
+    } else {
+      class_test(1, pba->error_message,
+                 "out of range: tau=%e < tau_min=%e\n", tau, pba->tau_table[0]);
+    }
+  }
 
-  class_test(tau > pba->tau_table[pba->bt_size-1],
-             pba->error_message,
-             "out of range: tau=%e > tau_max=%e\n",tau,pba->tau_table[pba->bt_size-1]);
+  if (tau > pba->tau_table[pba->bt_size-1]) {
+    if (pba->r_s > 0. || pba->has_dddc == _TRUE_) {
+      tau = pba->tau_table[pba->bt_size - 1];
+    } else {
+      class_test(1, pba->error_message,
+                 "out of range: tau=%e > tau_max=%e\n", tau, pba->tau_table[pba->bt_size-1]);
+    }
+  }
 
   /** - interpolate from pre-computed table with array_interpolate() */
   class_call(array_interpolate_spline(
@@ -555,6 +916,23 @@ int background_functions(
     dp_dloga += (a*dw_over_da-3*(1+w_fld)*w_fld)*pvecback[pba->index_bg_rho_fld];
   }
 
+  /* BEC STR fluid */
+  if (pba->has_dddc_bec == _TRUE_) {
+    pvecback[pba->index_bg_rho_str] = pvecback_B[pba->index_bi_rho_str];
+    rho_tot += pvecback[pba->index_bg_rho_str];
+    /* P_restoring contribution to p_tot and dp_dloga */
+    double a_over_aeq_bg = a / pba->a_eq_bec;
+    double sat_arg_bg    = pba->k_bec * pow(fmax(a_over_aeq_bg, 0.), pba->n_bec);
+    double P_rest_bg_raw = pba->P_max_bec * (1.0 - exp(-sat_arg_bg));
+    double P_rest_cap_bg = 1e5 * fmax(fabs(pvecback_B[pba->index_bi_rho_str]), 1e-30);
+    double P_rest_bg     = fmin(P_rest_bg_raw, P_rest_cap_bg);
+    double dP_rest_dloga = (P_rest_bg_raw <= P_rest_cap_bg)
+                           ? pba->P_max_bec * pba->n_bec * sat_arg_bg * exp(-sat_arg_bg)
+                           : 0.0;
+    p_tot    += P_rest_bg;
+    dp_dloga += dP_rest_dloga;
+  }
+
   /* relativistic neutrinos (and all relativistic relics) */
   if (pba->has_ur == _TRUE_) {
     pvecback[pba->index_bg_rho_ur] = pba->Omega0_ur * pow(pba->H0,2) / pow(a,4);
@@ -581,6 +959,205 @@ int background_functions(
   /** - compute derivative of H with respect to conformal time */
   pvecback[pba->index_bg_H_prime] = - (3./2.) * (rho_tot + p_tot) * a + pba->K/a;
 
+  /** - DDDC Interior Schwarzschild: two-phase background evolution.
+      Active when r_s > 0. Uses centralized caps (DDDC_H_LIMIT, DDDC_INV_D_MIN).
+      Phase 1 (a < a_min_dddc): pure FLRW — only populate custom DDDC slots;
+          standard CLASS variables (index_bg_H, rho_tot, etc.) are untouched.
+      Phase 2 (a >= a_min_dddc): DDDC era — power-law coordinate time with
+          Interior Schwarzschild time dilation. */
+  if (pba->r_s > 0.) {
+
+    /* Geometry check: R_geom > r_s (skipped when skip_buchdahl_check == _TRUE_) */
+    if (pba->skip_buchdahl_check == _FALSE_)
+      class_test(pba->R_geom <= pba->r_s,
+                 pba->error_message,
+                 "Interior Schwarzschild DDDC: R_geom = %e must be > r_s = %e",
+                 pba->R_geom, pba->r_s);
+
+    /* Always use the true scale factor.  At early times (a << a_min_dddc) the
+     * tanh blending weight is naturally ~0, so H_blended → H_flrw without any
+     * special clamping.  When H_coord would diverge (e.g. n_exp < 1 at a_ini),
+     * dddc_soft_H already caps it at DDDC_H_LIMIT; that cap combined with the
+     * near-zero blending weight means H_blended remains indistinguishable from
+     * H_flrw.  Freezing a_eff at pba->r_s (the Schwarzschild radius in Hubble
+     * units, typically >> 1) was catastrophically wrong: it drove the blending
+     * weight to 1, replacing the radiation-era H_flrw with a late-universe
+     * H_dddc and producing Omega_r ~ 10^53 at a_ini. */
+    double a_eff       = a;
+    short  a_is_frozen = _FALSE_;
+
+    /* Standard FLRW H calculated by CLASS prior to this block */
+    double H_flrw = pvecback[pba->index_bg_H];
+
+    /* Blended Hubble rate evaluated at a_eff */
+    double H_blended_current = background_dddc_blended_H(pba, a_eff, H_flrw);
+
+    /* Numerical dH_blended/da.
+     * When frozen: H is constant w.r.t. a → dH_da = 0, H_prime_dddc = 0.
+     * When active: centred finite difference at the true a. */
+    double dH_da;
+    if (a_is_frozen == _TRUE_) {
+      dH_da = 0.0;
+    }
+    else {
+      /* Use a wider relative step (1e-4 instead of 1e-5) so the finite
+         difference straddles the transition region more accurately.  The
+         1e-5 step is below the characteristic scale of the blending sigmoid
+         near a_min_dddc, causing systematic underestimation of dH/da there. */
+      double fd_eps = 1e-4;
+      double a_plus  = a * (1.0 + fd_eps);
+      double a_minus = a * (1.0 - fd_eps);
+
+      /* Estimate H_flrw at a_plus/a_minus from the Friedmann differential:
+         d(H_flrw^2)/da = -3/a*(rho_tot+p_tot) + 2K/a^3 */
+      double dH2flrw_da  = -3.0/a * (rho_tot + p_tot) + 2.0*pba->K/(a*a*a);
+      double H_flrw_plus  = sqrt(fmax(H_flrw*H_flrw + dH2flrw_da*(a_plus  - a), 1e-30));
+      double H_flrw_minus = sqrt(fmax(H_flrw*H_flrw + dH2flrw_da*(a_minus - a), 1e-30));
+
+      double H_blended_plus  = background_dddc_blended_H(pba, a_plus,  H_flrw_plus);
+      double H_blended_minus = background_dddc_blended_H(pba, a_minus, H_flrw_minus);
+
+      dH_da = (H_blended_plus - H_blended_minus) / (2.0 * a * fd_eps);
+    }
+
+    /* Calculate H'_phys = dH_phys/dtau via the chain rule.
+     *
+     * In conformal time: da/dtau = a' = a*mathcal{H} = a*(a*H_phys) = a^2 * H.
+     * Therefore:
+     *   H'_phys = (da/dtau) * (dH_blended/da) = a^2 * H_blended * dH_da.
+     *
+     * The previous formula  a^2*H*(H + a*dH/da) = a^2*H^2 + a^3*H*dH/da
+     * is the CONFORMAL derivative  mathcal{H}' = d(aH)/dtau,  which is larger
+     * than H'_phys by exactly a^2*H^2.  Every CLASS consumer of index_bg_H_prime
+     * (perturbations.c, thermodynamics.c, transfer.c) reconstructs a''/a as
+     *   H_prime * a + 2*(aH)^2
+     * which requires H_prime = H'_phys; supplying mathcal{H}' instead would add
+     * an extra a^2*H^2 to a''/a, biasing all metric perturbation source terms. */
+    double H_prime_dddc = a * a * H_blended_current * dH_da;
+
+    /* DDDC Interior Schwarzschild: D(a) calculation for output.
+       Use a_eff so the dilation factor is consistent with the frozen H. */
+    double delta_a     = dddc_soft_delta_a(a_eff - pba->a_min_dddc);
+    double term_boundary = 1.5 * sqrt(1.0 - pba->r_s / pba->R_geom);
+    double term_internal = 0.5 * sqrt(1.0 - (pba->r_s * a_eff * a_eff) / pow(pba->R_geom, 3.0));
+    double inv_D_raw   = term_boundary - term_internal;
+    double inv_D_safe  = fmax(inv_D_raw, DDDC_INV_D_MIN);
+
+    /* Output to background vector */
+    pvecback[pba->index_bg_D_dilation] = 1.0 / inv_D_safe;
+    pvecback[pba->index_bg_H_proper]   = H_blended_current;
+    pvecback[pba->index_bg_H]          = H_blended_current;
+    pvecback[pba->index_bg_H_prime]    = H_prime_dddc;
+  }
+
+  /** - DDDC v2: pure compaction model — replace H and H' with the analytically-derived
+   *    lapse-function-regulated power law.  Active when has_dddc == _TRUE_.
+   *
+   *  Physics:
+   *    Lapse function:  N(a) = N_min + (1 - N_min) * a^3 / (a^3 + a_sat^3)
+   *    dN/da          = (1 - N_min) * 3 a^2 a_sat^3 / (a^3 + a_sat^3)^2
+   *    Proper Hubble:   H(a) = H_base * a^p / N(a),   p = n_exp - 1.5
+   *
+   *  H_prime stored in index_bg_H_prime is dH/d(conformal time tau):
+   *    dH/dtau = a^2 H * (dH/da) = a H^2 * [p - a*(dN/da)/N(a)]
+   *
+   *  NaN guard: a_ini is floored at 1e-14 elsewhere; when p < 0 and a ~ a_ini,
+   *  pow(a, p) is large but finite.  N(a) -> N_min > 0 regularises the ratio. */
+  if (pba->has_dddc == _TRUE_) {
+
+    /* --- Unpack pre-computed DDDC v2 parameters --- */
+    double H_base  = pba->H_base_dddc;   /* [Mpc^-1]       */
+    double p       = pba->p_dddc;        /* n_exp - 1.5     */
+    double N_min   = pba->N_min_dddc;    /* lapse floor     */
+    double a_sat   = pba->a_sat_dddc;    /* slack threshold */
+
+    /* --- Pre-compute denominator terms for the lapse function --- */
+    double a3      = a * a * a;
+    double a_sat3  = a_sat * a_sat * a_sat;
+    double denom   = a3 + a_sat3;           /* a^3 + a_sat^3          */
+    double denom2  = denom * denom;         /* (a^3 + a_sat^3)^2      */
+
+    /* --- Lapse function N(a) and its derivative dN/da --- */
+    double N_a     = N_min + (1. - N_min) * a3 / denom;
+    double dN_da   = (1. - N_min) * 3. * a * a * a_sat3 / denom2;
+
+    /* --- Proper Hubble rate H(a) = H_base * a^p / N(a) ---
+     * Guard: if a is at floor (1e-14) and p < 0, pow still finite. */
+    double a_p     = pow(a, p);             /* a^p                    */
+    double H_dddc  = H_base * a_p / N_a;   /* [Mpc^-1]               */
+
+    /* --- Conformal Hubble derivative H' = d(aH)/d(eta) stored in index_bg_H_prime.
+     *
+     * mathcal{H} = aH, so:
+     *   mathcal{H}' = d(aH)/deta = (da/deta)*H + a*(dH/deta)
+     *              = a^2*H*H + a*(a^2*H*(dH/da))
+     *              = a^2*H^2 * [1 + a*(dH/da)/H]
+     *
+     * With dH/da = H*(p/a - dN/da/N):
+     *   a*(dH/da)/H = p - a*dN/da/N
+     *
+     * Therefore: mathcal{H}' = a^2 * H^2 * (1 + p - a*dN/da/N)
+     *
+     * Unit check: H_base was computed in SI [s^-1] then converted to Mpc^-1 via
+     *   H_base_dddc = H_base_si * _Mpc_over_m_ / _c_
+     * so H_dddc is in [Mpc^-1] and H_prime is in [Mpc^-2], consistent with CLASS. */
+    double H_prime_dddc_v2 = a * a * H_dddc * H_dddc * (1.0 + p - a * dN_da / N_a);
+
+    /* --- Override standard FLRW values --- */
+    pvecback[pba->index_bg_H]       = H_dddc;
+    pvecback[pba->index_bg_H_prime] = H_prime_dddc_v2;
+  }
+
+  /* DDDC v4 BEC: override the Friedmann expansion engine.
+   * Proper-time Hubble rate is H_proper = sqrt(rho_tot - K/a^2).
+   * Dilation factor Gamma(a) bounds time dilation from below at Gamma_min_bec,
+   * reflecting that time is never accelerated — only dilated less as the universe
+   * expands toward its BEC equilibrium epoch.
+   * Coordinate Hubble rate seen by observers: H_coord = H_proper / Gamma_eff(a),
+   * with Gamma_eff(a) = Gamma_raw(a)/Gamma_raw(1). */
+  if (pba->has_dddc_bec == _TRUE_) {
+    double H_flrw_bec = pvecback[pba->index_bg_H];
+    double rho_eff_bec_raw = rho_tot - pba->K / a / a;
+    double rho_eff_bec = bec_soft_positive(rho_eff_bec_raw);
+    double H_proper_bec = sqrt(rho_eff_bec);
+    double Gamma_today = bec_gamma_raw(pba, 1.0);
+    class_test(Gamma_today <= 0.0,
+               pba->error_message,
+               "DDDC-BEC: Gamma_today = %e <= 0. Check Gamma_min_bec/a_eq_bec.",
+               Gamma_today);
+    double Gamma_eff = bec_gamma_eff(pba, a);
+    class_test(!isfinite(Gamma_eff) || Gamma_eff <= 0.0,
+               pba->error_message,
+               "DDDC-BEC: Gamma_eff(a=%e) is non-finite/non-positive (%e).",
+               a, Gamma_eff);
+    double H_coord_bec_raw = H_proper_bec / fmax(Gamma_eff, 1e-10);
+    double H_floor_ref = H_flrw_bec;
+    if (!isfinite(H_floor_ref) || H_floor_ref <= 0.0) {
+      /* When rho_tot-K/a^2 temporarily turns negative, H_flrw_bec is NaN.
+       * Fall back to the regularised proper-time H so the soft floor stays finite. */
+      H_floor_ref = H_proper_bec;
+    }
+    if (!isfinite(H_floor_ref) || H_floor_ref <= 0.0) {
+      H_floor_ref = 1e-18;
+    }
+    double H_floor_bec = BEC_H_FLOOR_FRAC * H_floor_ref;
+    double H_floor_eps = fabs(H_floor_bec) * 1e-6 + 1e-18;
+    double H_coord_bec = bec_soft_max(H_coord_bec_raw, H_floor_bec, H_floor_eps);
+    /* H_prime = dH_coord/dtau = a * H_coord * dH_coord/dlna.
+     * From H_coord = H_proper/Gamma_eff and d(H_proper)/dlna = -3(rho+p)/(2*H_proper):
+     *   dH_coord/dlna = -3(rho+p)/(2*H_proper*Gamma) - H_coord*d(lnGamma)/dlna
+     * d(lnGamma)/dlna is computed via chain rule through the soft-floor then soft-ceiling:
+     *   d(Gamma_floor)/dlna = Gamma_pow^2 * (alpha+m) / Gamma_floor
+     *   d(Gamma_ceil)/d(Gamma_floor) = (1 - (Gamma_floor-1)/sqrt((Gamma_floor-1)^2+eps^2)) / 2
+     *   d(lnGamma_eff)/dlna = d(lnGamma_raw)/dlna (Gamma_today is a constant in a)
+     * Both terms of H_prime are negative, so H_prime is always negative as physically required. */
+    double dlnGamma_dlna      = bec_dln_gamma_dlna(pba, a);
+    double H_prime_bec = -1.5 * a * (rho_tot + p_tot) / (Gamma_eff * Gamma_eff)
+                         - a * H_coord_bec * H_coord_bec * dlnGamma_dlna;
+    pvecback[pba->index_bg_H]       = H_coord_bec;
+    pvecback[pba->index_bg_H_prime] = H_prime_bec;
+  }
+
   /* Total energy density*/
   pvecback[pba->index_bg_rho_tot] = rho_tot;
 
@@ -596,11 +1173,23 @@ int background_functions(
     pvecback[pba->index_bg_p_tot_prime] += pvecback[pba->index_bg_p_prime_scf];
   }
 
-  /** - compute critical density */
-  rho_crit = rho_tot-pba->K/a/a;
-  class_test(rho_crit <= 0.,
-             pba->error_message,
-             "rho_crit = %e instead of strictly positive",rho_crit);
+  /** - compute critical density from the actual expansion rate H.
+   *
+   *  In standard FLRW, H = H_flrw = sqrt(rho_tot - K/a^2) by the Friedmann
+   *  equation, so H^2 = rho_tot - K/a^2 and the two expressions are identical.
+   *
+   *  In DDDC, the solver uses H_blended (stored in index_bg_H by the DDDC
+   *  override block above), which differs from H_flrw during the DDDC-active era.
+   *  Using H_blended^2 as rho_crit ensures that every Omega_i = rho_i / rho_crit
+   *  is normalised by the expansion rate the ODE integrator actually sees, making
+   *  the reported Omega values self-consistent with the background evolution.
+   *
+   *  Curvature is implicitly handled: for FLRW, H^2 already equals rho_tot - K/a^2;
+   *  for DDDC, rho_crit = H_blended^2 defines the effective flat-equivalent density. */
+  rho_crit = pvecback[pba->index_bg_H] * pvecback[pba->index_bg_H];
+  if (rho_crit < 1e-300) {
+    rho_crit = 1e-300;
+  }
 
   /** - compute relativistic density to total density ratio */
   pvecback[pba->index_bg_Omega_r] = rho_r / rho_crit;
@@ -1098,10 +1687,12 @@ int background_indices(
   /* - index interacting for dark radiation */
   class_define_index(pba->index_bg_rho_idr,pba->has_idr,index_bg,1);
 
-  /* - put here additional ingredients that you want to appear in the
-     normal vector */
-  /*    */
-  /*    */
+  /* - DDDC dilation factor and proper-time Hubble rate */
+  class_define_index(pba->index_bg_D_dilation, (pba->r_s > 0.), index_bg, 1);
+  class_define_index(pba->index_bg_H_proper,   (pba->r_s > 0.), index_bg, 1);
+
+  /* - index for BEC STR fluid density */
+  class_define_index(pba->index_bg_rho_str, pba->has_dddc_bec, index_bg, 1);
 
   /* - end of indices in the normal vector of background values */
   pba->bg_size_normal = index_bg;
@@ -1164,6 +1755,9 @@ int background_indices(
 
   /* -> energy density in fluid */
   class_define_index(pba->index_bi_rho_fld,pba->has_fld,index_bi,1);
+
+  /* -> BEC STR fluid density */
+  class_define_index(pba->index_bi_rho_str, pba->has_dddc_bec, index_bi, 1);
 
   /* -> scalar field and its derivative wrt conformal time (Zuma) */
   class_define_index(pba->index_bi_phi_scf,pba->has_scf,index_bi,1);
@@ -1857,6 +2451,89 @@ int background_checks(
     }
   }
 
+  /** - DDDC parameter validation (Interior Schwarzschild mode: r_s > 0)
+   *    Skipped entirely when DDDC v2 (has_dddc) is active — v2 bypasses
+   *    the blending machinery, so none of these checks are applicable. */
+  pba->use_soft_transition = _FALSE_;
+
+  if (pba->r_s > 0. && pba->has_dddc == _FALSE_) {
+
+    /* R_geom must strictly exceed the Schwarzschild radius (skippable) */
+    if (pba->skip_buchdahl_check == _FALSE_) {
+      class_test(pba->R_geom <= pba->r_s,
+                 pba->error_message,
+                 "DDDC: R_geom = %e must exceed r_s = %e (Schwarzschild radius)"
+                 " [set skip_buchdahl_check = yes to suppress]",
+                 pba->R_geom, pba->r_s);
+
+      /* R_geom must exceed the Buchdahl limit (9/8) * r_s to keep inv_D > 0 */
+      class_test(pba->R_geom < 1.125 * pba->r_s,
+                 pba->error_message,
+                 "DDDC: R_geom = %e must exceed the Buchdahl limit (9/8)*r_s = %e."
+                 " Increase R_geom or decrease r_s [set skip_buchdahl_check = yes to suppress].",
+                 pba->R_geom, 1.125 * pba->r_s);
+    }
+    else if (pba->background_verbose > 0 && pba->R_geom <= pba->r_s) {
+      printf(" -> DDDC WARNING: skip_buchdahl_check active."
+             " R_geom = %e < r_s = %e (Buchdahl violated — super-Schwarzschild geometry).\n",
+             pba->R_geom, pba->r_s);
+    }
+
+    /* a_min_dddc must be set when Interior Schwarzschild is active */
+    class_test(pba->a_min_dddc <= 0.,
+               pba->error_message,
+               "DDDC: r_s = %e > 0 but a_min_dddc = %e <= 0."
+               " Set a_min_dddc to the scale factor at which DDDC physics activates.",
+               pba->r_s, pba->a_min_dddc);
+
+    /* n_exp < 1 causes da/dtc = n_exp*k_dil*tc^(n_exp-1) to diverge as
+     * tc→0 (a→a_min_dddc), but dddc_soft_delta_a keeps tc bounded away from
+     * zero and dddc_soft_H caps H via tanh saturation, so n_exp < 1 is safe
+     * numerically.  No hard rejection — the integrator handles this. */
+    if (pba->background_verbose > 0 && pba->n_exp < 1.0)
+      printf(" -> DDDC: n_exp = %e < 1.0; H_coord divergence is regularised by"
+             " dddc_soft_H and dddc_soft_delta_a.\n", pba->n_exp);
+
+    /* Soft-transition must not significantly affect recombination (a ~ 9e-4).
+       Evaluate the blending weight (DDDC fraction) at recombination and reject
+       if it exceeds 1%.  This is physically meaningful regardless of whether
+       a_min_dddc is above or below recombination, and avoids the trivially-true
+       failure mode of a simple edge-distance check. */
+    {
+      double a_recomb  = 9.e-4;
+      double half_width = (pba->dddc_k_blend > 0.)
+                          ? 1.0 / pba->dddc_k_blend
+                          : pba->a_min_dddc * pba->dddc_transition_frac;
+      double x_recomb         = (a_recomb - pba->a_min_dddc) / half_width;
+      double weight_at_recomb = 0.5 * (1. + tanh(x_recomb));
+      class_test(weight_at_recomb > 1.e-2,
+                 pba->error_message,
+                 "DDDC: DDDC blending weight at recombination (a~9e-4) = %.2f%% (> 1%%)."
+                 " a_min_dddc = %e is too close to recombination given transition width = %e."
+                 " Increase a_min_dddc, reduce dddc_transition_frac, or increase dddc_k_blend.",
+                 weight_at_recomb * 100., pba->a_min_dddc, half_width);
+    }
+
+    /* Mark soft transition as active.
+     * force_amin_to_rs is no longer auto-enabled: freezing a_eff to pba->r_s
+     * (the Schwarzschild radius in Hubble units) was catastrophically wrong,
+     * driving the blending weight to 1 at a_ini and producing Omega_r ~ 1e53.
+     * The blending weight is naturally ~0 for a << a_min_dddc, so no clamping
+     * is needed; dddc_soft_H caps H_coord if n_exp < 1 causes a divergence. */
+    pba->use_soft_transition = _TRUE_;
+
+    if (pba->background_verbose > 0) {
+      double tw = (pba->dddc_k_blend > 0.)
+                  ? 1.0 / pba->dddc_k_blend
+                  : pba->a_min_dddc * pba->dddc_transition_frac;
+      if (pba->M0 > 0.)
+        printf(" -> DDDC: M0 = %e M_sun → r_s = %e Mpc\n", pba->M0, pba->r_s);
+      printf(" -> DDDC Interior Schwarzschild active:"
+             " r_s = %e, R_geom = %e, a_min_dddc = %e, transition_width = %e\n",
+             pba->r_s, pba->R_geom, pba->a_min_dddc, tw);
+    }
+  }
+
   return _SUCCESS_;
 }
 
@@ -1881,6 +2558,8 @@ int background_solve(
   struct background_parameters_and_workspace bpaw;
   /* vector of quantities to be integrated */
   double * pvecback_integration;
+  /* copy of initial integration vector for safe retry with alternate evolver */
+  double * pvecback_integration_ini;
   /* vector of all background quantities */
   double * pvecback;
   /* comoving radius coordinate in Mpc (equal to conformal distance in flat case) */
@@ -1895,6 +2574,8 @@ int background_solve(
 
   /* initial and final loga values */
   double loga_ini, loga_final;
+  /* effective integration tolerance (may be relaxed in stiff custom models) */
+  double tol_background_used;
   /* growth factor today */
   double D_today;
   /* indices for the different arrays */
@@ -1912,11 +2593,15 @@ int background_solve(
 
   /** - allocate vector of quantities to be integrated */
   class_alloc(pvecback_integration,pba->bi_size*sizeof(double),pba->error_message);
+  class_alloc(pvecback_integration_ini,pba->bi_size*sizeof(double),pba->error_message);
 
   /** - impose initial conditions with background_initial_conditions() */
   class_call(background_initial_conditions(ppr,pba,pvecback,pvecback_integration,&(loga_ini)),
              pba->error_message,
              pba->error_message);
+  memcpy(pvecback_integration_ini,
+         pvecback_integration,
+         pba->bi_size*sizeof(double));
 
   /** - Determine output vector */
   loga_final = 0.; // with our conventions, loga is in fact log(a/a_0); we integrate until today, when log(a/a_0) = 0
@@ -1959,15 +2644,26 @@ int background_solve(
     break;
   }
 
+  tol_background_used = ppr->tol_background_integration;
+  if (pba->has_dddc_bec == _TRUE_ && tol_background_used < 1e-6) {
+    tol_background_used = 1e-6;
+    if (pba->background_verbose > 0) {
+      printf(" -> DDDC-BEC: relaxing tol_background_integration from %.3e to %.3e for stability.\n",
+             ppr->tol_background_integration, tol_background_used);
+    }
+  }
+
   /** - perform the integration */
-  class_call(generic_evolver(background_derivs,
+  {
+    int status;
+    status = generic_evolver(background_derivs,
                              loga_ini,
                              loga_final,
                              pvecback_integration,
                              used_in_output,
                              pba->bi_size,
                              &bpaw,
-                             ppr->tol_background_integration,
+                             tol_background_used,
                              ppr->smallest_allowed_variation,
                              background_timescale, //'evaluate_timescale', required by evolver_rk but not by ndf15
                              ppr->background_integration_stepsize,
@@ -1975,9 +2671,43 @@ int background_solve(
                              pba->bt_size,
                              background_sources,
                              NULL, //'print_variables' in evolver_rk could be set, but, not required
-                             pba->error_message),
-             pba->error_message,
-             pba->error_message);
+                             pba->error_message);
+
+    /* DDDC-BEC safety net: ndf15 can fail with "step size too small" for
+       steep parameter combinations. Retry from pristine initial conditions
+       with the more robust RK evolver before aborting. */
+    if ((status == _FAILURE_) &&
+        (pba->has_dddc_bec == _TRUE_) &&
+        (generic_evolver == evolver_ndf15)) {
+      if (pba->background_verbose > 0) {
+        printf(" -> DDDC-BEC: ndf15 failed in background_solve (%s)\n", pba->error_message);
+        printf("    Retrying with rk evolver.\n");
+      }
+      memcpy(pvecback_integration,
+             pvecback_integration_ini,
+             pba->bi_size*sizeof(double));
+      status = evolver_rk(background_derivs,
+                          loga_ini,
+                          loga_final,
+                          pvecback_integration,
+                          used_in_output,
+                          pba->bi_size,
+                          &bpaw,
+                          tol_background_used,
+                          ppr->smallest_allowed_variation,
+                          background_timescale,
+                          ppr->background_integration_stepsize,
+                          pba->loga_table,
+                          pba->bt_size,
+                          background_sources,
+                          NULL,
+                          pba->error_message);
+    }
+
+    class_call(status,
+               pba->error_message,
+               pba->error_message);
+  }
 
   /** - recover some quantities today */
   /* -> age in Gyears */
@@ -2109,8 +2839,46 @@ int background_solve(
     }
   }
 
+  /** - DDDC normalization check: warn when H_blended(a=1) ≠ H0.
+   *
+   *  Every species density is seeded as Omega0_X * H0^2 / a^N, which anchors
+   *  the Friedmann sum to H0.  In DDDC, the blended Hubble rate at a=1 may differ
+   *  from H0 because DDDC modifies H without rescaling the densities.  When the
+   *  deviation exceeds 1%, the reported Omega_i and all distance integrals are
+   *  biased relative to the expansion history actually used by the solver.
+   *
+   *  This is a diagnostic, not a hard error: the run completes, but the user
+   *  should adjust Omega0 inputs until H_blended(a=1) ≈ H0. */
+  if ((pba->r_s > 0. || pba->a_rs > 0.) && pba->background_verbose > 0) {
+    double H_today  = pba->background_table[(pba->bt_size-1)*pba->bg_size+pba->index_bg_H];
+    double H0_dev   = fabs(H_today - pba->H0) / pba->H0;
+    if (H0_dev > 0.01) {
+      printf("DDDC WARNING: H_blended(a=1) = %.6e Mpc^-1, input H0 = %.6e Mpc^-1"
+             " (deviation = %.2f%%).\n"
+             "              Omega_i values are normalised by rho_crit = H_blended^2,"
+             " but all species densities were seeded with H0^2.\n"
+             "              Distances, the age, and sigma8 are self-consistent with"
+             " H_blended, but H0-derived observables are biased.\n"
+             "              Remedy: scale each Omega0_X so that"
+             " sum(Omega0_X)*H_blended(a=1)^2 = H0^2.\n",
+             H_today, pba->H0, H0_dev * 100.0);
+    }
+  }
+
+  if (pba->has_dddc_bec == _TRUE_) {
+    double z_obs_check;
+    class_call(background_dddc_z_of_a(pba, 1.0, &z_obs_check, pba->error_message),
+               pba->error_message,
+               pba->error_message);
+    class_test(fabs(z_obs_check) > 1e-10,
+               pba->error_message,
+               "DDDC-BEC normalization failed: background_dddc_z_of_a(a=1)=%.16e (tolerance 1e-10).",
+               z_obs_check);
+  }
+
   free(pvecback);
   free(pvecback_integration);
+  free(pvecback_integration_ini);
   free(used_in_output);
 
   return _SUCCESS_;
@@ -2152,6 +2920,52 @@ int background_initial_conditions(
 
   /** - fix initial value of \f$ a \f$ */
   a = ppr->a_ini_over_a_today_default;
+
+  /** - DDDC v2 safety: prevent ODE stiffness from extreme 1/(a·H) at early times.
+   *
+   *  Two failure modes exist depending on the sign of p = n_exp - 1.5:
+   *
+   *  p < 0 : H = H_base·a^p/N diverges as a→0 — H is too LARGE (step size driven to 0)
+   *  p >= 0: H = H_base·a^p/N → 0 as a→0   — H is too SMALL (1/(aH) becomes huge,
+   *            making ODE derivatives enormous and the Jacobian ill-conditioned)
+   *
+   *  In both cases, ndf15 hits its minimum step size immediately.
+   *
+   *  Strategy: raise a_ini so that 1/(a·H_dddc) stays below DDDC_STIFF_LIMIT.
+   *  For small a: H ≈ H_base·a^p/N_min, so 1/(aH) = N_min/(H_base·a^(1+p)).
+   *  Setting this < limit:  a > [N_min / (H_base·limit)]^(1/(1+p))  for p > -1.
+   *
+   *  The p < 0 divergence is also captured: H too large means 1/(aH) too small,
+   *  which is the opposite problem — we use DDDC_H_LIMIT to cap that case.
+   *  Both limits are computed and we take the more conservative (larger) a_floor. */
+  if (pba->has_dddc == _TRUE_) {
+    double N_min_safe  = fmax(pba->N_min_dddc, 1e-6);
+    double H_base      = pba->H_base_dddc;
+    double p           = pba->p_dddc;
+
+    /* Stiffness floor: keep 1/(a·H) < DDDC_STIFF_LIMIT [Mpc] */
+    static const double DDDC_STIFF_LIMIT = 1e13;
+    double a_stiff = 0.;
+    if (p > -1.0 + 1e-6) {
+      /* General formula (covers p >= 0 and mild negative p) */
+      a_stiff = pow(N_min_safe / (H_base * DDDC_STIFF_LIMIT), 1.0 / (1.0 + p));
+    }
+    else {
+      /* p ≈ -1: 1/(aH) is nearly constant in a; use linear estimate */
+      a_stiff = N_min_safe / (H_base * DDDC_STIFF_LIMIT);
+    }
+
+    /* Divergence floor: keep H < DDDC_H_LIMIT when p < 0 */
+    double a_div = 0.;
+    if (p < 0.) {
+      a_div = pow(H_base / (DDDC_H_LIMIT * N_min_safe), 1.0 / (-p));
+    }
+
+    double a_floor = fmax(1e-14, fmax(a_stiff, a_div));
+    if (a < a_floor) {
+      a = a_floor;
+    }
+  }
 
   /**  If we have ncdm species, perhaps we need to start earlier
        than the standard value for the species to be relativistic.
@@ -2256,6 +3070,75 @@ int background_initial_conditions(
 
   }
 
+  /** - BEC STR fluid: baryon-anchor boundary condition.
+   *
+   * Define the present-day STR density to close a baryon+radiation-only universe:
+   *   rho_str(a=1) = rho_crit0 - (rho_b0 + rho_r0).
+   *
+   * Since the ODE is integrated from a_ini -> 1, back-propagate this boundary
+   * through d(rho_str)/dlna + 3 rho_str = 3 P_rest(a) (uncapped source) using
+   * an integrating factor:
+   *   rho_str(a_ini) = [rho_str(1) - 3 * integral_{a_ini}^1 a^2 P_rest(a) da] / a_ini^3.
+   *
+   * This enforces the requested Section 4 anchor at a=1 while providing a stable
+   * forward initial condition for the solver. */
+  if (pba->has_dddc_bec == _TRUE_) {
+    double rho_crit_0 = pba->H0 * pba->H0;
+    double rho_baryon_0 = pba->Omega0_b * rho_crit_0;
+    double Omega_radiation_0 = pba->Omega0_g;
+    double rho_str_today;
+    double source_integral = 0.0;
+    int i_step;
+    int n_steps = 400; /* must stay even for Simpson integration */
+
+    if (pba->has_ur == _TRUE_) {
+      Omega_radiation_0 += pba->Omega0_ur;
+    }
+    if (pba->has_idr == _TRUE_) {
+      Omega_radiation_0 += pba->Omega0_idr;
+    }
+
+    rho_str_today = rho_crit_0 - (rho_baryon_0 + Omega_radiation_0 * rho_crit_0);
+
+    class_test(rho_str_today <= 0.0,
+               pba->error_message,
+               "DDDC-BEC anchor failed: rho_str(a=1)=%e <= 0 from rho_crit0-(rho_b0+rho_r0).",
+               rho_str_today);
+
+    if (a < 1.0) {
+      double da = (1.0 - a) / n_steps;
+      for (i_step = 0; i_step <= n_steps; i_step++) {
+        double a_i = a + i_step * da;
+        double a_over_aeq_i = a_i / pba->a_eq_bec;
+        double sat_arg_i = pba->k_bec * pow(fmax(a_over_aeq_i, 0.), pba->n_bec);
+        double P_rest_i = pba->P_max_bec * (1.0 - exp(-sat_arg_i));
+        double weight_i;
+
+        if (i_step == 0 || i_step == n_steps) {
+          weight_i = 1.0;
+        }
+        else if (i_step % 2 == 0) {
+          weight_i = 2.0;
+        }
+        else {
+          weight_i = 4.0;
+        }
+
+        source_integral += weight_i * a_i * a_i * P_rest_i;
+      }
+      /* source_integral = 3 * integral a^2 P(a) da, with Simpson's rule */
+      source_integral *= da;
+    }
+
+    pvecback_integration[pba->index_bi_rho_str] =
+      (rho_str_today - source_integral) / pow(a, 3);
+
+    class_test(!isfinite(pvecback_integration[pba->index_bi_rho_str]),
+               pba->error_message,
+               "DDDC-BEC initial rho_str(a_ini) is not finite (%e) from baryon-anchor back-propagation.",
+               pvecback_integration[pba->index_bi_rho_str]);
+  }
+
   /** - Fix initial value of \f$ \phi, \phi' \f$
    * set directly in the radiation attractor => fixes the units in terms of rho_ur
    *
@@ -2298,26 +3181,51 @@ int background_initial_conditions(
              pba->error_message);
 
   /* Just checking that our initial time indeed is deep enough in the radiation
-     dominated regime */
-  class_test(fabs(pvecback[pba->index_bg_Omega_r]-1.) > ppr->tol_initial_Omega_r,
-             pba->error_message,
-             "Omega_r = %e, not close enough to 1. Decrease a_ini_over_a_today_default in order to start from radiation domination.",
-             pvecback[pba->index_bg_Omega_r]);
+     dominated regime.
+     DDDC v2/v4: this check is bypassed because H is driven by the compaction density
+     formula, not by the Friedmann sum — Omega_r = rho_r/H_dddc^2 need not equal 1
+     at a_ini even when radiation dominates the matter content. */
+  if (pba->has_dddc == _FALSE_ && pba->has_dddc_bec == _FALSE_) {
+    class_test(fabs(pvecback[pba->index_bg_Omega_r]-1.) > ppr->tol_initial_Omega_r,
+               pba->error_message,
+               "Omega_r = %e, not close enough to 1. Decrease a_ini_over_a_today_default in order to start from radiation domination.",
+               pvecback[pba->index_bg_Omega_r]);
+  }
 
-  /** - compute initial proper time, assuming radiation-dominated
-      universe since Big Bang and therefore \f$ t=1/(2H) \f$ (good
-      approximation for most purposes) */
+  /** - compute initial proper time and conformal time.
+   *
+   *  In standard RD: t = 1/(2 H_proper) and τ = 1/(a H_proper).
+   *
+   *  Mode 0 (default): background_functions has stored H_proper in index_bg_H, so
+   *  the standard formulae apply directly.  If DDDC is inactive at a_ini (the usual
+   *  case when a_ini << a_min_dddc), H_proper = H_flrw and the classic RD limit is
+   *  recovered.  When DDDC is active even at a_ini (e.g. Exponential mode), H_proper
+   *  already carries the dilation factor, giving a correspondingly smaller t_ini —
+   *  physically correct since the proper clock ran slower in the denser early universe.
+   *
+   *  Mode 1 (integration_mode==1, r_s>0): background_functions stores H_coord.
+   *  Proper time is slowed by inv_D(a_ini): t_ini = inv_D/(2 H_coord),
+   *  and τ_ini = inv_D/(a H_coord).  This seeds the integrator consistently with
+   *  the dτ/dlna = inv_D/(aH) formula used in background_derivs for Mode 1. */
 
   class_test(pvecback[pba->index_bg_H] <= 0.,
              pba->error_message,
              "H = %e instead of strictly positive",pvecback[pba->index_bg_H]);
 
-  pvecback_integration[pba->index_bi_time] = 1./(2.* pvecback[pba->index_bg_H]);
-
-  /** - compute initial conformal time, assuming radiation-dominated
-      universe since Big Bang and therefore \f$ \tau=1/(aH) \f$
-      (good approximation for most purposes) */
-  pvecback_integration[pba->index_bi_tau] = 1./(a * pvecback[pba->index_bg_H]);
+  if (pba->integration_mode == 1 && pba->r_s > 0.) {
+    /* Mode 1: H = H_coord at a_ini.  Scale both ICs by inv_D(a_ini). */
+    double rs       = pba->r_s;
+    double R        = pba->R_geom;
+    double inv_D_ic = dddc_regularize_inv_D(
+      1.5 * sqrt(1.0 - rs / R) - 0.5 * sqrt(1.0 - (rs * a * a) / (R * R * R)));
+    pvecback_integration[pba->index_bi_time] = inv_D_ic / (2.0 * pvecback[pba->index_bg_H]);
+    pvecback_integration[pba->index_bi_tau]  = inv_D_ic / (a  * pvecback[pba->index_bg_H]);
+  }
+  else {
+    /* Mode 0 / standard: H = H_proper.  Standard RD formulae are exact. */
+    pvecback_integration[pba->index_bi_time] = 1.0 / (2.0 * pvecback[pba->index_bg_H]);
+    pvecback_integration[pba->index_bi_tau]  = 1.0 / (a   * pvecback[pba->index_bg_H]);
+  }
 
   /** - compute initial sound horizon, assuming \f$ c_s=1/\sqrt{3} \f$ initially */
   pvecback_integration[pba->index_bi_rs] = pvecback_integration[pba->index_bi_tau]/sqrt(3.);
@@ -2579,6 +3487,229 @@ int background_output_data(
  * usual to pba->error_message, but to a generic error_message passed
  * in the list of arguments.
  *
+ * Compute the DDDC time dilation factor D(a) = dt_c / dtau.
+ *
+ * In Density Driven Dilation Cosmology, proper time is dilated
+ * relative to coordinate time by a density-dependent factor.
+ * The core rule is: time is never accelerated, only dilated less.
+ *
+ * @param pba           Input: pointer to background structure
+ * @param a             Input: current scale factor
+ * @param D             Output: dilation factor (>= 1)
+ * @param error_message Output: error message
+ */
+
+int background_dilation_factor(
+                               struct background * pba,
+                               double a,
+                               double * D,
+                               ErrorMsg error_message
+                               ) {
+
+  switch (pba->dilation_mode) {
+
+  case 1: {
+    /* Interior Schwarzschild: inv_D = 1.5*sqrt(1 - rs/R) - 0.5*sqrt(1 - rs*a^2/R^3) */
+    double rs = pba->r_s;
+    double R  = pba->R_geom;
+    double inv_D;
+
+    if (pba->skip_buchdahl_check == _FALSE_)
+      class_test(R <= rs,
+                 error_message,
+                 "DDDC Interior Schwarzschild: R_geom = %e must exceed r_s = %e",
+                 R, rs);
+
+    /* Clamp to avoid sqrt of negative when R < rs (super-Schwarzschild geometry).
+     * With skip_buchdahl_check the geometry may be unphysical; regularization
+     * keeps the ODE alive so the optimizer can evaluate the likelihood. */
+    double arg_boundary = fmax(1.0 - rs / R, 0.0);
+    double arg_internal = fmax(1.0 - (rs * a * a) / (R * R * R), 0.0);
+    inv_D = 1.5 * sqrt(arg_boundary) - 0.5 * sqrt(arg_internal);
+
+    /* Regularize BEFORE the guard: near-Buchdahl bisection calls (e.g. from
+       background_dddc_a_of_z probing a close to a_min_dddc) must not hard-crash.
+       Only fail when inv_D is deeply negative AND we are enforcing the check. */
+    double inv_D_reg = dddc_regularize_inv_D(inv_D);
+    if (pba->skip_buchdahl_check == _FALSE_)
+      class_test(inv_D < -0.1,
+                 error_message,
+                 "DDDC Interior Schwarzschild: Buchdahl limit badly violated at a = %e"
+                 " (inv_D = %e << 0). Check r_s and R_geom.",
+                 a, inv_D);
+
+    *D = 1.0 / inv_D_reg;
+    break;
+  }
+
+  case 2:
+    /* Exponential: D = exp(a_rs / a) */
+    *D = exp(pba->a_rs / a);
+    break;
+
+  default:
+    /* No dilation */
+    *D = 1.0;
+    break;
+  }
+
+  return _SUCCESS_;
+}
+
+/**
+ * Compute the DDDC observed redshift for a given scale factor.
+ *
+ * In DDDC, the observed redshift combines expansion and dilation:
+ *   (1 + Z_obs) = (1/a) * D(a) / D(1)
+ *
+ * When a_rs = 0 (no dilation), this reduces to the standard z = 1/a - 1.
+ *
+ * @param pba    Input: pointer to background structure
+ * @param a      Input: scale factor
+ * @param z_obs  Output: observed redshift
+ * @param error_message Output: error message
+ */
+
+int background_dddc_z_of_a(
+                            struct background * pba,
+                            double a,
+                            double * z_obs,
+                            ErrorMsg error_message
+                            ) {
+
+  double D_a, D_today;
+
+  /* DDDC v4 BEC: telescope redshift decoupled from coordinate expansion.
+   * z_obs = 1/(a * Gamma_eff(a)) - 1, with Gamma_eff(a)=Gamma_raw(a)/Gamma_raw(1).
+   * This automatically routes through z_table to correct angular diameter
+   * distance (index_bg_ang_distance) and luminosity distance (index_bg_lum_distance). */
+  if (pba->has_dddc_bec == _TRUE_) {
+    double Gamma_eff = bec_gamma_eff(pba, a);
+    *z_obs = MAX(0., 1.0 / (a * fmax(Gamma_eff, 1e-10)) - 1.0);
+    return _SUCCESS_;
+  }
+
+  /* If no dilation is configured, fall back to standard relation.
+   * Check both a_rs (Exponential mode) and r_s (Interior Schwarzschild mode):
+   * dilation_mode defaults to 1 (Schwarzschild) but is inactive when r_s == 0. */
+  if (pba->a_rs == 0. && pba->r_s == 0.) {
+    *z_obs = MAX(0., 1./a - 1.);
+    return _SUCCESS_;
+  }
+
+  class_call(background_dilation_factor(pba, a, &D_a, error_message),
+             error_message,
+             error_message);
+
+  class_call(background_dilation_factor(pba, 1.0, &D_today, error_message),
+             error_message,
+             error_message);
+
+  *z_obs = MAX(0., (D_a / D_today) / a - 1.);
+
+  return _SUCCESS_;
+}
+
+/**
+ * Find the scale factor corresponding to a given DDDC observed redshift.
+ *
+ * Solves (1 + Z_obs) = (1/a) * D(a) / D(1) for a, using bisection.
+ *
+ * The function f(a) = (1/a)*D(a)/D(1) is monotonically decreasing in a
+ * (expansion dominates), so bisection is robust.
+ *
+ * @param pba    Input: pointer to background structure
+ * @param z_obs  Input: target observed redshift
+ * @param a      Output: scale factor
+ * @param error_message Output: error message
+ */
+
+int background_dddc_a_of_z(
+                            struct background * pba,
+                            double z_obs,
+                            double * a,
+                            ErrorMsg error_message
+                            ) {
+
+  double a_lo, a_hi, a_mid;
+  double z_lo, z_hi, z_mid;
+  int iter;
+  int max_iter = 100;
+  double tol = 1.e-12;
+
+  /* If no dilation is configured, fall back to standard relation.
+   * Mirror the guard in background_dddc_z_of_a: both a_rs and r_s must be
+   * zero to indicate no active dilation (a_rs alone misses Schwarzschild mode). */
+  if (pba->a_rs == 0. && pba->r_s == 0.) {
+    *a = 1. / (1. + z_obs);
+    return _SUCCESS_;
+  }
+
+  /* Bisection bounds: a in [a_lo, 1].
+   *
+   * a_lo must be small enough that z_dddc(a_lo) > any z CLASS will ever query,
+   * including recombination (z~1100, a~9e-4) and the radiation/matter equality
+   * epoch probed by background_find_equality().
+   *
+   * The previous code used a_lo = a_min_dddc * 0.9, which only reached z~(1/a_min-1).
+   * For a_min_dddc = 0.007 that cap is z~142 — far below recombination at z~1100.
+   *
+   * At a << a_min_dddc the blending weight → 0, so z_dddc ≈ z_FLRW = 1/a - 1
+   * and the Interior Schwarzschild formula is well-behaved (inv_D ≈ 1).
+   * There is no Buchdahl issue at small a.
+   * CLASS perturbations can query z~1e14 (a~1e-14), so use 1e-16 for margin. */
+  a_hi = 1.0;
+  a_lo = 1.e-16;
+
+  /* Verify bracket: z(a_hi) should be < z_obs and z(a_lo) should be > z_obs */
+  class_call(background_dddc_z_of_a(pba, a_lo, &z_lo, error_message),
+             error_message,
+             error_message);
+
+  class_call(background_dddc_z_of_a(pba, a_hi, &z_hi, error_message),
+             error_message,
+             error_message);
+
+  class_test(z_obs > z_lo,
+             error_message,
+             "DDDC a_of_z: z_obs = %e exceeds maximum computable redshift z(a_lo) = %e",
+             z_obs, z_lo);
+
+  class_test(z_obs < z_hi,
+             error_message,
+             "DDDC a_of_z: z_obs = %e below minimum redshift z(a_hi=1) = %e",
+             z_obs, z_hi);
+
+  /* Bisection loop */
+  for (iter = 0; iter < max_iter; iter++) {
+
+    a_mid = 0.5 * (a_lo + a_hi);
+
+    class_call(background_dddc_z_of_a(pba, a_mid, &z_mid, error_message),
+               error_message,
+               error_message);
+
+    if (fabs(z_mid - z_obs) < tol * (1. + z_obs)) {
+      *a = a_mid;
+      return _SUCCESS_;
+    }
+
+    /* z is monotonically decreasing in a: if z_mid > z_obs, a is too small */
+    if (z_mid > z_obs) {
+      a_lo = a_mid;
+    }
+    else {
+      a_hi = a_mid;
+    }
+  }
+
+  /* If we get here, return best guess */
+  *a = 0.5 * (a_lo + a_hi);
+
+  return _SUCCESS_;
+}
+
+/**
  * @param loga                     Input: current value of log(a)
  * @param y                        Input: vector of variable
  * @param dy                       Output: its derivative (already allocated)
@@ -2616,14 +3747,62 @@ int background_derivs(
              pba->error_message,
              error_message);
 
-  /** - Short hand notation for Hubble */
+  /** - Short hand notation for Hubble (already includes DDDC dilation D(a) if active) */
   H = pvecback[pba->index_bg_H];
+  if (H < 1e-60) {
+    H = 1e-60;
+  }
 
-  /** - calculate derivative of cosmological time \f$ dt/dloga = 1/H \f$ */
-  dy[pba->index_bi_time] = 1./H;
+  /** - calculate derivative of proper time: dt_proper/dlna = 1/H_proper.
+   *
+   *  The physical Hubble rate H_proper is defined via the observer's proper clock:
+   *  H_proper = (da/dt_proper)/a.  So dt_proper/dlna = 1/H_proper, always.
+   *
+   *  Mode 0 (default): background_functions stores H_proper in index_bg_H — the
+   *  physical expansion rate already incorporating DDDC time dilation.  The
+   *  integrand is simply 1/H.
+   *
+   *  Mode 1 (integration_mode==1, r_s>0): background_functions stores H_coord
+   *  (the raw coordinate-time expansion rate).  In the Interior Schwarzschild
+   *  metric, proper time is slowed by the metric factor inv_D = sqrt(g_tt) < 1:
+   *    dt_proper = inv_D * dt_coord   →   dt_proper/dlna = inv_D / H_coord = inv_D / H. */
+  if (pba->integration_mode == 1 && pba->r_s > 0.) {
+    /* Mode 1: H = H_coord.  Apply inv_D to convert to proper-time step. */
+    double rs    = pba->r_s;
+    double R     = pba->R_geom;
+    double inv_D = dddc_regularize_inv_D(
+      1.5 * sqrt(1.0 - rs / R) - 0.5 * sqrt(1.0 - (rs * a * a) / (R * R * R)));
+    dy[pba->index_bi_time] = inv_D / H;
+  }
+  else {
+    /* Mode 0 / standard FLRW: H already stores H_proper.  1/H is exact. */
+    dy[pba->index_bi_time] = 1.0 / H;
+  }
 
-  /** - calculate derivative of conformal time \f$ d\tau/dloga = 1/aH \f$ */
-  dy[pba->index_bi_tau] = 1./a/H;
+  /** - calculate derivative of conformal time: dτ/dlna = inv_D / (a * H_coord).
+   *
+   *  Conformal time is tied to the proper-time clock: dτ = dt_proper / a, so
+   *    dτ/dlna = (dt_proper/dlna) / a = (inv_D / H_coord) / a = inv_D / (a * H_coord).
+   *
+   *  Mode 0: H = H_proper = H_coord / inv_D
+   *    → 1/(a*H_proper) = inv_D/(a*H_coord)  ✓  (dilation-aware via H_proper)
+   *
+   *  Mode 1: H = H_coord (finite everywhere, no 1/inv_D blow-up near Buchdahl limit)
+   *    → inv_D/(a*H_coord) = inv_D/(a*H)     ✓  (inv_D applied explicitly)
+   *
+   *  Both modes converge to dτ/dlna = 1/(aH) in the FLRW limit (inv_D → 1). */
+  if (pba->integration_mode == 1 && pba->r_s > 0.) {
+    /* Mode 1: H = H_coord.  Must apply inv_D explicitly. */
+    double rs    = pba->r_s;
+    double R     = pba->R_geom;
+    double inv_D = dddc_regularize_inv_D(
+      1.5 * sqrt(1.0 - rs / R) - 0.5 * sqrt(1.0 - (rs * a * a) / (R * R * R)));
+    dy[pba->index_bi_tau] = inv_D / (a * H);
+  }
+  else {
+    /* Mode 0 / standard: H = H_proper.  1/(a*H_proper) encodes dilation naturally. */
+    dy[pba->index_bi_tau] = 1.0 / (a * H);
+  }
 
   class_test(pvecback[pba->index_bg_rho_g] <= 0.,
              error_message,
@@ -2642,8 +3821,19 @@ int background_derivs(
     rho_M += pvecback[pba->index_bg_rho_idm];
   }
 
-  dy[pba->index_bi_D] = y[pba->index_bi_D_prime]/a/H;
-  dy[pba->index_bi_D_prime] = -y[pba->index_bi_D_prime] + 1.5*a*rho_M*y[pba->index_bi_D]/H;
+  /* Growth factor D and D': freeze to their initial values in DDDC v4 BEC mode.
+   *
+   * D is used only for the CMB/matter power spectrum (output ≠ '').  When fitting
+   * supernova distances and CMB distance priors (output = '') D is never queried.
+   * Freezing dy_D = dy_D_prime = 0 keeps the Jacobian trivially finite. */
+  if (pba->has_dddc_bec == _TRUE_) {
+    dy[pba->index_bi_D]       = 0.0;
+    dy[pba->index_bi_D_prime] = 0.0;
+  }
+  else {
+    dy[pba->index_bi_D]       = y[pba->index_bi_D_prime]/a/H;
+    dy[pba->index_bi_D_prime] = -y[pba->index_bi_D_prime] + 1.5*a*rho_M*y[pba->index_bi_D]/H;
+  }
 
   if (pba->has_dcdm == _TRUE_) {
     /** - compute dcdm density \f$ d\rho/dloga = -3 \rho - \Gamma/H \rho \f$*/
@@ -2660,11 +3850,50 @@ int background_derivs(
     dy[pba->index_bi_rho_fld] = -3.*(1.+pvecback[pba->index_bg_w_fld])*y[pba->index_bi_rho_fld];
   }
 
+  if (pba->has_dddc_bec == _TRUE_) {
+    /* BEC STR fluid ODE in solver variable:
+     * d(rho_STR)/dloga = -3 * (rho_STR - P_restoring)
+     * (equivalent to d(rho_STR)/da = -3/a * (rho_STR - P_restoring)).
+     * P_restoring uses saturated exponential to prevent NaN at a->0.
+     * Time is never accelerated here — only dilated less as a grows toward a_eq. */
+    double a_over_aeq  = a / pba->a_eq_bec;
+    double sat_arg     = pba->k_bec * pow(fmax(a_over_aeq, 0.), pba->n_bec);
+    double P_rest_raw  = pba->P_max_bec * (1.0 - exp(-sat_arg));
+    double P_rest_cap  = 1e5 * fmax(fabs(y[pba->index_bi_rho_str]), 1e-30);
+    double P_restoring = fmin(P_rest_raw, P_rest_cap);
+    dy[pba->index_bi_rho_str] = -3.0 * (y[pba->index_bi_rho_str] - P_restoring);
+    
+    if (a < 1e-12 || fabs(dy[pba->index_bi_rho_str]) > 1e10 || !isfinite(dy[pba->index_bi_rho_str])) {
+       // Just catching to see if this is the issue, though it shouldn't be.
+    }
+  }
+
   if (pba->has_scf == _TRUE_) {
     /** - Scalar field equation: \f$ \phi'' + 2 a H \phi' + a^2 dV = 0 \f$  (note H is wrt cosmological time)
         written as \f$ d\phi/dlna = phi' / (aH) \f$ and \f$ d\phi'/dlna = -2*phi' - (a/H) dV \f$ */
     dy[pba->index_bi_phi_scf] = y[pba->index_bi_phi_prime_scf]/a/H;
     dy[pba->index_bi_phi_prime_scf] = - 2*y[pba->index_bi_phi_prime_scf] - a*dV_scf(pba,y[pba->index_bi_phi_scf])/H ;
+  }
+
+  /* Sanity check: all integrated derivatives must be finite.
+   * This guard fires after every dy[] entry is assigned so the logged values
+   * reflect the actual computed derivatives, not stale malloc contents. */
+  if (!isfinite(dy[pba->index_bi_tau]) || !isfinite(dy[pba->index_bi_D]) ||
+      !isfinite(dy[pba->index_bi_D_prime]) || !isfinite(dy[pba->index_bi_rs])) {
+    fprintf(stderr, "DEBUG bg_derivs NaN/Inf: a=%e H=%e dy_tau=%e dy_D=%e dy_Dprime=%e dy_rs=%e y_D=%e y_Dprime=%e\n",
+            a, H, dy[pba->index_bi_tau], dy[pba->index_bi_D], dy[pba->index_bi_D_prime],
+            dy[pba->index_bi_rs], y[pba->index_bi_D], y[pba->index_bi_D_prime]);
+    fflush(stderr);
+  }
+  
+  if (pba->has_dddc_bec == _TRUE_) {
+    int bec_anomaly = (!isfinite(dy[pba->index_bi_rho_str]) || fabs(dy[pba->index_bi_rho_str]) > 1e10) ? _TRUE_ : _FALSE_;
+    background_bec_debug_log(a,
+                             H,
+                             y[pba->index_bi_rho_str],
+                             dy[pba->index_bi_rho_str],
+                             pba->P_max_bec,
+                             bec_anomaly);
   }
 
   return _SUCCESS_;
@@ -2716,11 +3945,22 @@ int background_sources(
   /** - scale factor a (in fact, given our normalisation conventions, this stands for a/a_0) */
   a = exp(loga);
 
-  /** - corresponding redhsift 1/a-1 */
-  pba->z_table[index_loga] = MAX(0.,1./a-1.);
+  /** - corresponding redshift: DDDC-aware (combines expansion + dilation) */
+  {
+    double z_obs_temp;
+    class_call(background_dddc_z_of_a(pba, a, &z_obs_temp, error_message),
+               error_message,
+               error_message);
+    pba->z_table[index_loga] = z_obs_temp;
+  }
 
   /** - corresponding conformal time */
   pba->tau_table[index_loga] = y[pba->index_bi_tau];
+  if (!isfinite(y[pba->index_bi_tau])) {
+    fprintf(stderr, "DEBUG bg_output_function: tau NaN/Inf at index_loga=%d loga=%e a=%e tau=%e\n",
+            index_loga, pba->loga_table[index_loga], a, y[pba->index_bi_tau]);
+    fflush(stderr);
+  }
 
   /** -> compute all other quantities depending only on a + {B} variables and get them stored
       in one row of background_table

@@ -1,5 +1,5 @@
 """
-.. module:: classy
+.. module:: classy_dddc
     :synopsis: Python wrapper around CLASS
 .. moduleauthor:: Karim Benabed <benabed@iap.fr>
 .. moduleauthor:: Benjamin Audren <benjamin.audren@epfl.ch>
@@ -89,7 +89,7 @@ cdef class Class:
 
     The actual Class wrapping, the only class we will call from MontePython
     (indeed the only one we will import, with the command:
-    from classy import Class
+    from classy_dddc import Class
 
     """
     # List of used structures, defined in the header file. They have to be
@@ -346,7 +346,7 @@ cdef class Class:
         if default: self.set_default()
         try:
           import importlib.resources
-          resource_path = abspath(importlib.resources.files('classy'))
+          resource_path = abspath(importlib.resources.files('classy_dddc'))
         except ImportError as ie:
           resource_path = dirname(abspath(__file__))
         path_to_this_as_bytes = resource_path.encode()
@@ -3216,6 +3216,33 @@ cdef class Class:
         free(titles)
         free(data)
         return background
+
+    def get_dilation_factor(self, a):
+        """
+        Return the dilation factor D(a) at scale factor a.
+        """
+        cdef double D
+        if background_dilation_factor(&self.ba, a, &D, self.ba.error_message) == _FAILURE_:
+            raise CosmoSevereError(self.ba.error_message)
+        return D
+
+    def dddc_z_of_a(self, a):
+        """
+        Return the observed redshift z_obs(a) for a given scale factor a.
+        """
+        cdef double z_obs
+        if background_dddc_z_of_a(&self.ba, a, &z_obs, self.ba.error_message) == _FAILURE_:
+            raise CosmoSevereError(self.ba.error_message)
+        return z_obs
+
+    def dddc_a_of_z(self, z_obs):
+        """
+        Return the scale factor a(z_obs) for a given observed redshift z_obs.
+        """
+        cdef double a
+        if background_dddc_a_of_z(&self.ba, z_obs, &a, self.ba.error_message) == _FAILURE_:
+            raise CosmoSevereError(self.ba.error_message)
+        return a
 
     def get_thermodynamics(self):
         """

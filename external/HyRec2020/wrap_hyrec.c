@@ -134,7 +134,13 @@ int hyrec_dx_H_dz(struct thermodynamics* pth, struct thermohyrec* phy, double x_
     Trad_phys /= phy->data->cosmo->fsR*phy->data->cosmo->fsR*phy->data->cosmo->meR; //According to 1705.03925
   }
 
-  if (Trad_phys <= TR_MIN || Tmat/Trad <= T_RATIO_MIN) { model = PEEBLES; }
+  /* TR_MAX guard: SWIFT/FULL rate tables are only tabulated up to TR_MAX (0.4 eV, ~4640 K).
+   * Above that temperature hydrogen is near Saha equilibrium (dx_H/dz ~ 0).
+   * Fall back to PEEBLES (two-level atom, no rate tables) which is valid at all temperatures.
+   * Without this guard, non-standard expansion histories (e.g. DDDC with n_exp<1) can push
+   * the Saha-departure redshift above z~1700, causing rec_swift_hyrec_dxHIIdlna to call
+   * interpolate_rates with TR >> TR_MAX and crash. */
+  if (Trad_phys <= TR_MIN || Trad_phys > TR_MAX || Tmat/Trad <= T_RATIO_MIN) { model = PEEBLES; }
   else { model = MODEL; }
 
   /** - convert to correct units, and retrieve derivative */

@@ -1,5 +1,5 @@
 [project]
-name = "classy"
+name = "classy_dddc"
 dynamic=["version"]
 description="Python interface to the Cosmological Boltzmann code CLASS"
 authors = [

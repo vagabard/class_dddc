@@ -54,7 +54,7 @@ with open(os.path.join(include_folder, 'common.h'), 'r') as v_file:
             break
 
 # Define cython extension and fix Python version
-classy_ext = Extension("classy._classy", [os.path.join("python", "classy.pyx")],
+classy_ext = Extension("classy_dddc._classy", [os.path.join("python", "classy.pyx")],
                        include_dirs=[np.get_include(), include_folder, heat_folder, recfast_folder, hyrec_folder],
                        libraries=liblist,
                        library_dirs=[root_folder, GCCPATH],
@@ -114,15 +114,15 @@ class classy_builder(build_ext):
 
 # Finally, perform the actual setup
 setup(
-    name='classy',
+    name='classy_dddc',
     version=VERSION,
     description='Python interface to the Cosmological Boltzmann code CLASS',
     url='http://www.class-code.net',
     cmdclass={'build_ext': classy_builder},
     ext_modules=[classy_ext],
-    packages = ["classy"],
-    package_dir={"classy":"."},
-    package_data={'classy': pck_files},
+    packages = ["classy_dddc"],
+    package_dir={"classy_dddc":"."},
+    package_data={'classy_dddc': pck_files},
     include_package_data=True,
     zip_safe=False
 )

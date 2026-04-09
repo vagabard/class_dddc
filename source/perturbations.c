@@ -8199,6 +8199,83 @@ int perturbations_print_variables(double tau,
   a2 = a*a;
   H = pvecback[pba->index_bg_H];
 
+  /** DDDC stiffness watchdog -----------------------------------------------
+   *
+   * Fires every DDDC_WATCHDOG_INTERVAL evaluations when DDDC is active.
+   * Purpose: confirm the solver is not stuck (runaway call count signals
+   * an ODE stall) and show where in the dilation history it is when that
+   * happens.
+   *
+   * Columns logged:
+   *   calls      — total perturbations_derivs invocations so far
+   *   a          — current scale factor
+   *   z_exp      — expansion-only redshift 1/a − 1
+   *   z_obs      — DDDC observed redshift  D(a)/(a·D₀) − 1
+   *   D          — dilation factor D(a)
+   *   H_proper   — locally-measured Hubble rate [Mpc⁻¹]  (= H_blended)
+   *   H_coord    — coordinate-time Hubble rate [Mpc⁻¹]   (= H_proper / D)
+   *   dD/D       — fractional change in D relative to previous watchdog call
+   *                 (large |dD/D| flags the transition epoch most stressing
+   *                  the ODE integrator)
+   *
+   * Interior Schwarzschild (r_s > 0): reads D and H_proper from pvecback.
+   * Exponential mode (a_rs > 0, r_s == 0): computes D via background_dilation_factor.
+   * Both modes compute z_obs = D(a)/(a·D_today) − 1 analytically to avoid
+   * the bisection overhead of background_dddc_a_of_z.
+   *
+   * The watchdog is read-only — it never modifies any ODE state. ---------- */
+#define DDDC_WATCHDOG_INTERVAL 10000L
+  if (pba->r_s > 0. || pba->a_rs > 0.) {
+    static long  _pert_deriv_calls   = 0L;
+    static double _prev_D_dilation   = 1.0; /* dilation factor at last watchdog print */
+    _pert_deriv_calls++;
+
+    if (_pert_deriv_calls % DDDC_WATCHDOG_INTERVAL == 0) {
+
+      double D_a      = 1.0;  /* dilation factor at current a */
+      double D_today  = 1.0;  /* dilation factor at a = 1 (today) */
+      double H_proper = H;    /* locally-measured Hubble rate */
+      double H_coord  = H;    /* coordinate-time Hubble rate */
+
+      /* --- Retrieve or compute D(a) --- */
+      if (pba->r_s > 0.) {
+        /* Interior Schwarzschild: D stored in pvecback */
+        D_a     = pvecback[pba->index_bg_D_dilation];
+        H_proper = pvecback[pba->index_bg_H_proper];
+      }
+      else {
+        /* Exponential mode: compute D(a) from formula (no pvecback slot) */
+        background_dilation_factor(pba, a, &D_a, error_message);
+      }
+
+      /* D_today = D(a=1) — constant per run, cheap arithmetic */
+      background_dilation_factor(pba, 1.0, &D_today, error_message);
+
+      /* Coordinate-time Hubble rate: H_coord = H_proper / D(a)
+       * (H_proper = D·H_coord because proper time runs D× slower) */
+      if (D_a > 0.)
+        H_coord = H_proper / D_a;
+
+      /* DDDC observed redshift: z_obs = D(a)/(a·D_today) − 1
+       * Avoids the bisection in background_dddc_a_of_z. */
+      double z_exp = 1.0 / a - 1.0;
+      double z_obs = (D_today > 0.) ? (D_a / (a * D_today) - 1.0) : z_exp;
+
+      /* Fractional change in D since last watchdog print */
+      double dD_over_D = (_prev_D_dilation > 0.)
+                         ? (D_a - _prev_D_dilation) / _prev_D_dilation
+                         : 0.0;
+      _prev_D_dilation = D_a;
+
+      printf("[DDDC-WATCHDOG] calls=%ld  a=%.6e  z_exp=%.4e  z_obs=%.4e"
+             "  D=%.6f  H_proper=%.6e  H_coord=%.6e  dD/D=%.4e\n",
+             _pert_deriv_calls, a, z_exp, z_obs,
+             D_a, H_proper, H_coord, dD_over_D);
+      fflush(stdout);
+    }
+  }
+#undef DDDC_WATCHDOG_INTERVAL
+
   if (pba->has_ncdm == _TRUE_){
     class_alloc(delta_ncdm, sizeof(double)*pba->N_ncdm,error_message);
     class_alloc(theta_ncdm, sizeof(double)*pba->N_ncdm,error_message);
@@ -8765,6 +8842,7 @@ int perturbations_derivs(double tau,
   double alpha_rec=0.,delta_alpha_rec=0.;
   double a_rad=0., Compton_CR =0.;
   double Tb_in_K=0.;
+  double T_gamma=0.;  /* DDDC-aware local photon temperature [K]; set in perturbed-recombination pre-computation block */
 
 
   /* Non-metric source terms for photons, i.e. \mathcal{P}^{(m)} from arXiv:1305.3261  */
@@ -8850,6 +8928,23 @@ int perturbations_derivs(double tau,
   a2 = a*a;
   a_prime_over_a = pvecback[pba->index_bg_H] * a;
   R = 4./3. * pvecback[pba->index_bg_rho_g]/pvecback[pba->index_bg_rho_b];
+
+  /* DDDC debug: emit diagnostics every 10000 evaluations to track stiffness */
+  if (pba->r_s > 0.) {
+    static int dddc_eval_count = 0;
+    dddc_eval_count++;
+    if (dddc_eval_count % 10000 == 0) {
+      /* Report DDDC observed redshift (expansion + dilation), not bare 1/a-1. */
+      double z_here;
+      if (background_dddc_z_of_a(pba, a, &z_here, error_message) != _SUCCESS_)
+        z_here = 1./a - 1.;
+      fprintf(stderr, "[DDDC-perturbations] eval=%d tau=%.4e z_obs=%.1f k=%.4e aH=%.4e H=%.4e dkappa=%.4e tca=%d\n",
+              dddc_eval_count, tau, z_here, k, a_prime_over_a,
+              pvecback[pba->index_bg_H],
+              pvecthermo[pth->index_th_dkappa],
+              ppw->approx[ppw->index_ap_tca]);
+    }
+  }
 
   photon_scattering_rate = pvecthermo[pth->index_th_dkappa];
 
@@ -8949,6 +9044,40 @@ int perturbations_derivs(double tau,
 
       // Compton cooling rate in Mpc^(-1)
       Compton_CR = 8./3. *_sigma_ * a_rad /(_m_e_ * _c_ *_c_) *_Mpc_over_m_   ;
+
+      /** DDDC: dilation-aware local photon temperature.
+       *
+       * Standard FLRW: T_γ(a) = T_cmb / a   (adiabatic expansion cooling only).
+       *
+       * In DDDC, local clocks tick slower by D(a) relative to coordinate time.
+       * A photon with coordinate frequency ν_c arrives at a local observer whose
+       * proper clock runs at dτ_proper = dt_c / D(a); the observer therefore
+       * measures ν_proper = ν_c * D(a).  The CMB temperature T_cmb is defined by
+       * what we measure TODAY (a = 1, dilation factor D_today = D(1)), so the
+       * locally correct photon temperature at epoch a is:
+       *
+       *   T_γ = T_cmb * D(a) / (a * D_today)  =  T_cmb * (1 + z_obs)
+       *
+       * Consistency checks:
+       *   a = 1  → T_γ = T_cmb * D(1)/D(1) = T_cmb                     ✓
+       *   FLRW (D ≡ 1) → T_γ = T_cmb / a                               ✓
+       *
+       * Using T_cmb/a instead of T_γ would under/over-estimate the photon
+       * energy density (T_γ^4) driving Compton heating, biasing the
+       * delta_temp ODE and the perturbed ionisation history. */
+      T_gamma = pba->T_cmb / a;   /* default: FLRW or DDDC-inactive */
+      if (pba->r_s > 0. || pba->a_rs > 0.) {
+        /* DDDC-aware T_gamma: T = T_cmb * D(a) / (a * D_today) */
+        double D_a_local, D_today_local;
+        class_call(background_dilation_factor(pba, a, &D_a_local, error_message),
+                   pba->error_message,
+                   error_message);
+        class_call(background_dilation_factor(pba, 1.0, &D_today_local, error_message),
+                   pba->error_message,
+                   error_message);
+        if (D_today_local > 0.)
+          T_gamma = pba->T_cmb * D_a_local / (a * D_today_local);
+      }
 
       // Temperature is already in Kelvin
       Tb_in_K = pvecthermo[pth->index_th_Tb];
@@ -9296,9 +9425,14 @@ int perturbations_derivs(double tau,
       dy[ppw->pv->index_pt_perturbed_recombination_delta_chi] = - alpha_rec* a * chi*n_H  *(delta_alpha_rec + delta_chi + delta_b) * _Mpc_over_m_ / _c_ ;
 
       /* see the documentation for this formula */
+      /* T_gamma is the dilation-aware local photon temperature (= T_cmb/a in FLRW,
+       * = T_cmb * D(a)/(a * D_today) in DDDC).  It was computed in the
+       * perturbed-recombination pre-computation block above.
+       * All three T_cmb/a occurrences are replaced: the T_γ^4 photon energy-density
+       * factor and both T_γ/T_b ratios that weight the Compton heating terms. */
       dy[ppw->pv->index_pt_perturbed_recombination_delta_temp] =  2./3. * dy[ppw->pv->index_pt_delta_b] - a * Compton_CR
-        * pow(pba->T_cmb/a, 4) * chi / (1.+chi+fHe) * ( (1.-pba->T_cmb/a/pvecthermo[pth->index_th_Tb])*(delta_g + delta_chi*(1.+fHe)/(1.+chi+fHe))
-                                                        + pba->T_cmb/a/pvecthermo[pth->index_th_Tb] *(delta_temp - 1./4. * delta_g) );
+        * pow(T_gamma, 4) * chi / (1.+chi+fHe) * ( (1.-T_gamma/pvecthermo[pth->index_th_Tb])*(delta_g + delta_chi*(1.+fHe)/(1.+chi+fHe))
+                                                  + T_gamma/pvecthermo[pth->index_th_Tb] *(delta_temp - 1./4. * delta_g) );
 
     }
 

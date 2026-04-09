@@ -1,0 +1,269 @@
+DDDC_PARAMETERS_FOR_CLASS
+=========================
+Reference for non-standard parameters accepted by CLASS_DDDC.
+Pass these via the same dictionary you use for standard CLASS parameters.
+
+All DDDC parameters are optional. If none are set, CLASS runs in standard
+FLRW mode.
+
+Current DDDC model:
+  v4 (Bounded Elastic Continuum / BEC) — activated by a_eq_bec > 0 and
+                          P_max_bec > 0
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+DDDC v4 — BOUNDED ELASTIC CONTINUUM (BEC)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+The BEC model treats spacetime as an elastic medium (Spacetime-Tension-
+Restoring, STR, fluid) that develops a restoring pressure as the universe
+expands through its BEC equilibrium epoch a_eq_bec. Time dilation is coupled
+to the density field through the dilation exponents alpha_bec and m_bec.
+
+  Core equations:
+    P_rest(a)  = P_max_bec * (1 - exp(-k_bec * (a/a_eq_bec)^n_bec))
+                                                  [restoring pressure]
+    Gamma_pow  = (a/a_eq_bec)^alpha_bec * a^m_bec [dilation power]
+    Gamma_bec  = sqrt(Gamma_pow^2 + Gamma_min_bec^2), capped at 1
+                                                  [dilation factor]
+    H_coord    = H_proper / Gamma_bec             [coordinate Hubble rate]
+    z_obs      = 1 / (a * Gamma_bec) - 1          [observed redshift]
+
+  STR fluid ODE (evolved alongside the background):
+    d(rho_str)/dlna = -3 * (rho_str + P_rest(a))
+
+  The soft-maximum in Gamma_bec ensures C-infinity smoothness:
+    sqrt(Gamma_pow^2 + Gamma_min_bec^2) → Gamma_pow for Gamma_pow >> Gamma_min_bec
+                                        → Gamma_min_bec for Gamma_pow → 0
+
+ACTIVATION: set a_eq_bec > 0  AND  P_max_bec > 0.
+Both conditions must be met; all other v4 parameters have safe defaults.
+
+
+a_eq_bec
+  Type:    float [dimensionless scale factor]
+  Default: 0.0  (v4 inactive)
+  Activates: v4 BEC model (with P_max_bec > 0)
+  Physical meaning:
+    The BEC equilibrium scale factor — the epoch at which the STR restoring
+    pressure reaches half of its saturation value P_max_bec (for k_bec=1,
+    n_bec=1; exact half-saturation is at k_bec*(a/a_eq)^n_bec = ln 2).
+    It sets the overall timing of the BEC transition: a_eq_bec ~ 1 puts the
+    transition near today; a_eq_bec < 1 puts it in the past.
+  Notes:
+    Also appears in the dilation factor:
+      Gamma_pow = (a/a_eq_bec)^alpha_bec * a^m_bec
+    Set a_eq_bec to the scale factor of interest; then tune alpha_bec,
+    m_bec, and Gamma_min_bec to match the desired dilation profile.
+
+
+P_max_bec
+  Type:    float [Mpc^-2]
+  Default: 0.0  (v4 inactive)
+  Activates: v4 BEC model (with a_eq_bec > 0)
+  Physical meaning:
+    The maximum (saturation) restoring pressure of the STR fluid.
+    As a → ∞ the pressure saturates at P_max_bec. The STR fluid evolves via:
+      d(rho_str)/dlna = -3 * (rho_str + P_max_bec*(1-exp(-k_bec*(a/a_eq)^n_bec)))
+    P_max_bec sets the energy scale of the elastic medium. Values too large
+    relative to the matter/radiation densities will dominate the expansion.
+  Notes:
+    Units are CLASS internal pressure units (Mpc^-2), same as rho.
+    Start with small P_max_bec and verify the background table before
+    enabling the full coupling through alpha_bec.
+
+
+k_bec
+  Type:    float [dimensionless]
+  Default: 1.0
+  Physical meaning:
+    Saturation rate constant in the restoring pressure:
+      P_rest = P_max_bec * (1 - exp(-k_bec * (a/a_eq_bec)^n_bec))
+    Larger k_bec → pressure saturates earlier relative to a_eq_bec.
+    k_bec = 1 with n_bec = 1 gives half-saturation at a = a_eq_bec.
+  Notes:
+    Works in concert with n_bec to shape the pressure onset curve.
+    Has no effect if P_max_bec = 0.
+
+
+n_bec
+  Type:    float [dimensionless]
+  Default: 1.0
+  Physical meaning:
+    Power-law exponent for the expansion-law argument in the restoring
+    pressure:
+      P_rest = P_max_bec * (1 - exp(-k_bec * (a/a_eq_bec)^n_bec))
+    n_bec = 1  → linear onset (pressure grows proportional to a/a_eq).
+    n_bec > 1  → delayed onset followed by rapid saturation.
+    n_bec < 1  → earlier onset with gradual saturation.
+  Notes:
+    The dp/dlna term fed into the Hubble derivative is:
+      dp/dlna = P_max_bec * n_bec * sat_arg * exp(-sat_arg)
+    where sat_arg = k_bec * (a/a_eq_bec)^n_bec.
+
+
+Gamma_min_bec
+  Type:    float [dimensionless]
+  Default: 0.0
+  Physical meaning:
+    Minimum dilation factor floor. Sets a lower bound on Gamma_bec via a
+    soft maximum:
+      Gamma_bec = sqrt(Gamma_pow^2 + Gamma_min_bec^2)
+    where Gamma_pow = (a/a_eq_bec)^alpha_bec * a^m_bec.
+    When Gamma_pow >> Gamma_min_bec the floor is inactive; as Gamma_pow → 0
+    (e.g. at very early times when alpha_bec and m_bec are positive),
+    Gamma_bec → Gamma_min_bec instead of going to zero.
+    This prevents singular H_coord = H_proper / Gamma_bec at early epochs.
+  Notes:
+    The physical ceiling Gamma_bec <= 1 is always enforced (no super-luminal
+    time flow). Setting Gamma_min_bec = 0 is safe when alpha_bec = 0 and
+    m_bec = 0 (Gamma_pow = 1 everywhere).
+
+
+alpha_bec
+  Type:    float [dimensionless]
+  Default: 0.0
+  Physical meaning:
+    Dilation-density coupling exponent for the (a/a_eq_bec) factor:
+      Gamma_pow = (a/a_eq_bec)^alpha_bec * a^m_bec
+    alpha_bec = 0 removes the a_eq_bec dependence from the dilation factor
+    (coupling is only through a^m_bec). alpha_bec > 0 ties dilation to the
+    ratio of the current epoch to the BEC equilibrium epoch.
+  Notes:
+    The dilation H' derivative includes:
+      dlnGamma/dlna ∝ (alpha_bec + m_bec) * Gamma_pow^2 / Gamma_bec^2
+    Large alpha_bec can drive rapid dilation changes near a_eq_bec;
+    start with alpha_bec = 0 or small values.
+
+
+m_bec
+  Type:    float [dimensionless]
+  Default: 1.0
+  Physical meaning:
+    Stiffening exponent for the a^m_bec factor in the dilation power:
+      Gamma_pow = (a/a_eq_bec)^alpha_bec * a^m_bec
+    Controls how strongly the dilation factor grows with the scale factor.
+    m_bec = 0  → no direct scale-factor stiffening; dilation set by alpha_bec
+               only (or equals 1 if both exponents are 0).
+    m_bec = 1  → linear growth with a (default).
+    m_bec > 1  → super-linear stiffening at large a.
+  Notes:
+    Because Gamma_bec is capped at 1.0, large m_bec saturates dilation at
+    Gamma = 1 for a >> 1 regardless of the input value. Use Gamma_min_bec
+    to prevent the floor from being hit at early times when a << 1.
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+INTERNAL REGULARISATION CONSTANTS (NOT USER-SETTABLE)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+These are hardcoded in source/background.c. They are documented here for
+completeness so that numerical outputs can be interpreted correctly.
+
+DDDC_H_LIMIT = 100000.0  [Mpc^-1]
+  Asymptotic ceiling on the Hubble rate. Applied via a tanh saturation:
+    H_safe = DDDC_H_LIMIT * tanh(H_raw / DDDC_H_LIMIT)
+  H_safe → H_raw for H_raw << DDDC_H_LIMIT; saturates smoothly above it.
+  Prevents ODE blow-up when dilation compresses the early-time Hubble rate.
+
+BEC Gamma floor = 1e-10  [dimensionless]
+  Hard lower bound applied to Gamma_bec before dividing H_proper.
+  Prevents division by zero; always dominated by Gamma_min_bec in practice.
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+PYTHON USAGE EXAMPLES
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+from classy import Class
+
+# ── Example 1: DDDC v4 — Bounded Elastic Continuum (BEC) ────────────────
+cosmo = Class()
+cosmo.set({
+    # Standard CLASS parameters
+    'H0':             67.4,
+    'omega_b':        0.02237,
+    'omega_cdm':      0.1200,
+    'A_s':            2.1e-9,
+    'n_s':            0.965,
+    'tau_reio':       0.054,
+
+    # DDDC v4 — BEC model
+    # Activation: both a_eq_bec > 0 AND P_max_bec > 0 required.
+    'a_eq_bec':       0.5,      # BEC equilibrium epoch (scale factor)
+    'P_max_bec':      1e-7,     # max restoring pressure [Mpc^-2]; start small
+    'k_bec':          1.0,      # saturation rate constant (default)
+    'n_bec':          1.0,      # pressure onset exponent (default)
+    'Gamma_min_bec':  1e-3,     # dilation floor; prevents early-time singularity
+    'alpha_bec':      0.5,      # dilation-density coupling
+    'm_bec':          1.0,      # stiffening exponent (default)
+})
+cosmo.compute()
+
+bg = cosmo.get_background()
+a     = bg['a']
+z_obs = bg['z']           # BEC observed redshift (NOT 1/a-1)
+H     = bg['H [1/Mpc]']
+
+# Expansion-only redshift (for comparison):
+z_exp = 1.0 / a - 1.0
+
+# Dilation factor from BEC: Gamma_bec = 1 / (a * (1 + z_obs))  [approx]
+# (exact only when Gamma_today ≈ 1, i.e. when Gamma_bec(a=1) ≈ 1)
+Gamma_bec_approx = 1.0 / (a * (1.0 + z_obs))
+
+# ── Example 2: Pure FLRW (no DDDC) ───────────────────────────────────────
+cosmo = Class()
+cosmo.set({
+    'H0':      67.4,
+    'omega_b': 0.02237,
+    'omega_cdm': 0.1200,
+    # No DDDC parameters → standard CLASS behaviour
+})
+cosmo.compute()
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+PARAMETER CONSTRAINTS AND COMMON PITFALLS
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+1. The STR fluid density rho_str is initialised to zero at a_ini and is
+   evolved by the background ODE. If a_ini is set very close to a_eq_bec,
+   the rapid pressure onset near a_ini can cause stiffness. Set a_eq_bec
+   well above the initial scale factor.
+
+2. With alpha_bec > 0 and m_bec > 0, Gamma_pow → 0 at early times (small a),
+   making H_coord diverge. Always set Gamma_min_bec > 0 to impose a floor.
+   A safe starting value: Gamma_min_bec = 1e-3.
+
+3. P_max_bec enters rho_tot through the STR fluid. If P_max_bec is comparable
+   to the total energy density at a_ini, the initial H will be incorrect.
+   Start with P_max_bec small (< 1e-5 Mpc^-2) and increase gradually.
+
+4. Gamma_bec is capped at 1.0; setting m_bec >> 1 saturates dilation for
+   a > 1 but does NOT affect z_obs in the standard epoch a < 1.
+
+5. The 'z' column in cosmo.get_background() is z_obs (dilation-corrected).
+   It is NOT 1/a − 1. To get the pure expansion redshift:
+     z_exp = 1.0 / a - 1.0
+   The difference (z_obs − z_exp) quantifies the dilation contribution.
+
+6. The stiffness watchdog in perturbations_derivs prints to stdout every
+   10,000 ODE evaluations when BEC is active. Redirect stdout if running
+   in batch/MCMC mode.
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+SUMMARY TABLE
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+── v4 BOUNDED ELASTIC CONTINUUM (BEC) ──────────────────────────────────
+Parameter              Default  Type    Notes
+─────────────────────────────────────────────────────────────────────────
+a_eq_bec               0.0      float   ACTIVATES v4; BEC equilibrium scale factor
+P_max_bec              0.0      float   ACTIVATES v4; max restoring pressure [Mpc^-2]
+k_bec                  1.0      float   Saturation rate constant
+n_bec                  1.0      float   Pressure onset power-law exponent
+Gamma_min_bec          0.0      float   Dilation floor (set > 0 when alpha_bec or m_bec > 0)
+alpha_bec              0.0      float   Dilation-density coupling via (a/a_eq)^alpha
+m_bec                  1.0      float   Stiffening exponent via a^m in Gamma_pow

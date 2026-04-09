@@ -379,9 +379,13 @@ int thermodynamics_init(
 
   class_alloc(pvecback,pba->bg_size*sizeof(double),pba->error_message);
 
+  // printf("DEBUG: Entering thermodynamics_lists (z_initial = %e)...\n", ppr->thermo_z_initial);
+  // fflush(stdout);
   class_call(thermodynamics_lists(ppr,pba,pth,ptw),
              pth->error_message,
              pth->error_message);
+  // printf("DEBUG: thermodynamics_lists complete.\n");
+  // fflush(stdout);
 
   /** - initialize injection struct (not temporary) */
   if (pth->has_exotic_injection == _TRUE_) {
@@ -401,9 +405,13 @@ int thermodynamics_init(
              pth->error_message);
 
   /** - solve recombination and reionization and store values of \f$ z, x_e, d \kappa / d \tau, T_b, c_b^2 \f$  */
-  class_call(thermodynamics_solve(ppr,pba,pth,ptw,pvecback),
-             pth->error_message,
-             pth->error_message);
+  // printf("DEBUG: Entering thermodynamics_solve...\n");
+  // fflush(stdout);
+   class_call(thermodynamics_solve(ppr,pba,pth,ptw,pvecback),
+              pth->error_message,
+              pth->error_message);
+  // printf("DEBUG: thermodynamics_solve complete.\n");
+  // fflush(stdout);
 
   /** - the differential equation system is now completely solved  */
 
@@ -830,6 +838,9 @@ int thermodynamics_workspace_init(
   class_alloc(ptw->ptdw,
               sizeof(struct thermo_diffeq_workspace),
               pth->error_message);
+  /* class_alloc is malloc: explicitly NULL the vector pointer so any accidental
+     read before the first thermodynamics_vector_init call is detectable */
+  ptw->ptdw->ptv = NULL;
 
   // Initialize ionisation fraction.
   ptw->ptdw->x_reio = 1.+2.*ptw->fHe;
@@ -894,6 +905,66 @@ int thermodynamics_workspace_init(
   ptw->ptdw->ap_z_limits_delta[ptw->ptdw->index_ap_H] = ppr->recfast_delta_z_early_H_recombination;
   ptw->ptdw->ap_z_limits_delta[ptw->ptdw->index_ap_frec] = ppr->recfast_delta_z_full_H_recombination;
   ptw->ptdw->ap_z_limits_delta[ptw->ptdw->index_ap_reio] = ppr->recfast_delta_z_reio;
+
+  /** - DDDC: remap recombination approximation switching redshifts from FLRW z to
+   *    DDDC-observed z_obs.
+   *
+   *  Background: the precision parameters (recfast_z_He_1, recfast_z_He_2, …)
+   *  encode the physical temperature thresholds for each recombination event in
+   *  FLRW terms.  In FLRW, z_FLRW = 1/a − 1 everywhere, so each event has a
+   *  unique FLRW redshift: z_FLRW_event ≈ T_event/T_cmb − 1.
+   *
+   *  In DDDC the integration variable of this solver is z_obs (the observed
+   *  redshift including gravitational time-dilation):
+   *    1 + z_obs = D(a) / (a · D(1))   where D(a) ≥ 1.
+   *
+   *  The physical recombination events still happen at the same scale factors
+   *  (same baryon/photon densities locally), but those scale factors now map to
+   *  higher observed redshifts: z_obs_event > z_FLRW_event.
+   *
+   *  Without this correction the solver would switch approximation phases too
+   *  late in z_obs-space (i.e., the He/H ODE branches would activate after the
+   *  ionisation fraction has already started evolving rapidly), creating an
+   *  unnecessary stiffness hazard.
+   *
+   *  Conversion for each event:
+   *    a_event  = 1 / (1 + z_FLRW_event)
+   *    z_obs_event = background_dddc_z_of_a(pba, a_event)
+   *
+   *  The smoothing deltas are scaled by the same z_obs/z_FLRW ratio so the
+   *  blending windows remain proportional in the (stretched) z_obs coordinate.
+   *
+   *  Entries that are already at z = 0 (reionisation endpoint) are left
+   *  untouched; the idmtca entry is also skipped (DM-baryon decoupling is a
+   *  local process whose epoch does not shift in DDDC observed-redshift space). */
+  if (pba->r_s > 0. || pba->a_rs > 0.) {
+    int index_ap_remap;
+    for (index_ap_remap = 0; index_ap_remap < ptw->ptdw->ap_size; index_ap_remap++) {
+
+      double z_flrw_event = ptw->ptdw->ap_z_limits[index_ap_remap];
+
+      /* Skip reio endpoint (z = 0) and idmtca (DM physics, not a photon-temperature event) */
+      if (z_flrw_event <= 0.) continue;
+      if (ptw->has_ap_idmtca == _TRUE_ && index_ap_remap == ptw->ptdw->index_ap_idmtca) continue;
+
+      /* Physical scale factor at which this event occurs in FLRW */
+      double a_event = 1.0 / (1.0 + z_flrw_event);
+
+      /* DDDC observed redshift corresponding to the same scale factor */
+      double z_obs_event;
+      class_call(background_dddc_z_of_a(pba, a_event, &z_obs_event, pth->error_message),
+                 pth->error_message,
+                 pth->error_message);
+
+      /* Scale smoothing delta by the z_obs/z_FLRW stretch factor so the
+       * blending window covers the same physical Δa in z_obs coordinates. */
+      if (ptw->ptdw->ap_z_limits_delta[index_ap_remap] > 0.) {
+        ptw->ptdw->ap_z_limits_delta[index_ap_remap] *= z_obs_event / z_flrw_event;
+      }
+
+      ptw->ptdw->ap_z_limits[index_ap_remap] = z_obs_event;
+    }
+  }
 
   /* With recombination computed by HyRec or Recfast, we need to allocate and initialize the wrappers */
 
@@ -1114,10 +1185,47 @@ int thermodynamics_lists(
   /** Define local variables */
   int index_tau, index_z;
   double zinitial,zlinear;
+  int bg_start = 0; /* first background index inside thermodynamics z range (DDDC only) */
 
-  pth->tt_size = ptw->Nz_tot;
+  /** - determine table size
+   *
+   *  Standard (FLRW): use the precision-parameter-defined Nz_reco + Nz_reio grid.
+   *
+   *  DDDC: build the thermodynamics table directly from the background loga grid.
+   *  This eliminates the structural inconsistency where:
+   *    (a) the thermodynamics z_table stored FLRW z values, but
+   *    (b) the solver treated them as DDDC z_obs values (which include dilation),
+   *  causing every background_at_z call from thermodynamics_derivs to receive
+   *  a z_obs that lands between background grid points and require interpolation
+   *  over a grid that was built with a different z-mapping.
+   *
+   *  By anchoring the thermodynamics table to the background loga grid:
+   *   • Every z_table[i] = pba->z_table[bg_idx] is a solved point in the
+   *     background history, so background_at_z can hit the table exactly.
+   *   • tau_table[i] = pba->tau_table[bg_idx] — no background_tau_of_z
+   *     bisection needed; conformal times are copied directly.
+   *   • The background's log(a) spacing provides dense sampling during
+   *     recombination without a separate log/linear scheme.
+   *
+   *  bg_start: first background index with log(a) >= log(a_thermo_start),
+   *  where a_thermo_start = 1 / (1 + z_thermo_initial).  Points before
+   *  bg_start correspond to epochs earlier than thermodynamics cares about. */
 
-  /** - allocate tables*/
+  if (pba->r_s > 0. || pba->a_rs > 0.) {
+    /* DDDC branch: anchor to background loga grid */
+    double loga_thermo_start = log(1.0 / (1.0 + ppr->thermo_z_initial));
+    while (bg_start < pba->bt_size - 1 &&
+           pba->loga_table[bg_start] < loga_thermo_start)
+      bg_start++;
+    pth->tt_size = pba->bt_size - bg_start;
+    ptw->Nz_tot  = pth->tt_size; /* keep in sync for thermodynamics_solve */
+  }
+  else {
+    /* Standard FLRW branch */
+    pth->tt_size = ptw->Nz_tot;
+  }
+
+  /** - allocate tables */
   class_alloc(pth->tau_table,pth->tt_size*sizeof(double),pth->error_message);
   class_alloc(pth->z_table,pth->tt_size*sizeof(double),pth->error_message);
   class_alloc(pth->thermodynamics_table,pth->th_size*pth->tt_size*sizeof(double),pth->error_message);
@@ -1125,31 +1233,57 @@ int thermodynamics_lists(
 
   /** - define time sampling */
 
-  /* Initial z, and the z at which we switch to linear sampling */
-  zinitial = ppr->thermo_z_initial;
-  zlinear  = ppr->thermo_z_linear;
+  if (pba->r_s > 0. || pba->a_rs > 0.) {
 
-  /* -> Between z_initial and z_linear, we use the spacing of recombination sampling */
-  for (index_z=0; index_z <ptw->Nz_reco_log; index_z++) {
-    pth->z_table[(pth->tt_size-1) - index_z] = -(-exp((log(zinitial)-log(zlinear))*(double)(ptw->Nz_reco_log-1-index_z) / (double)(ptw->Nz_reco_log-1)+log(zlinear)));
+    /** DDDC: copy z_obs and tau directly from the background table.
+     *
+     * Ordering convention:
+     *   background: index 0 = a_ini (earliest, high z),  index bt_size-1 = today (z≈0)
+     *   thermo:     index 0 = today (z≈0),               index tt_size-1 = a_thermo_start
+     *
+     * The reversal index is: bg_idx = (bt_size-1) - index_tau
+     * So thermo[0]         ← bg[bt_size-1]  (today)
+     *    thermo[tt_size-1] ← bg[bg_start]   (earliest thermo point) */
+    for (index_tau = 0; index_tau < pth->tt_size; index_tau++) {
+      int bg_idx = pba->bt_size - 1 - index_tau;
+      pth->z_table[index_tau]   = pba->z_table[bg_idx];   /* z_obs, DDDC-aware */
+      pth->tau_table[index_tau] = pba->tau_table[bg_idx];  /* conformal time, direct copy */
+    }
+    fprintf(stderr, "DEBUG thermo_set_z_table: DDDC branch, bt_size=%d bg_start=%d tt_size=%d tau_table[0]=%e pba->tau_table[bt_size-1]=%e\n",
+            pba->bt_size, bg_start, pth->tt_size, pth->tau_table[0], pba->tau_table[pba->bt_size-1]);
+    fflush(stderr);
+
   }
+  else {
 
-  /* -> Between z_linear and reionization_z_start_max, we use the spacing of recombination sampling */
-  for (index_z=0; index_z <ptw->Nz_reco_lin; index_z++) {
-    pth->z_table[(pth->tt_size-1)-(index_z+ptw->Nz_reco_log)] = -(-(zlinear-ppr->reionization_z_start_max) * (double)(ptw->Nz_reco_lin-1-index_z) / (double)(ptw->Nz_reco_lin) - ppr->reionization_z_start_max);
-  }
+    /** Standard FLRW: log/linear z grid + background_tau_of_z lookup */
 
-  /* -> Between reionization_z_start_max and 0, we use the spacing of reionization sampling, leaving out the first point to not double-count it */
-  for (index_z=0; index_z <ptw->Nz_reio; index_z++) {
-    pth->z_table[(pth->tt_size-1)-(index_z+ptw->Nz_reco)] = -(-ppr->reionization_z_start_max * (double)(ptw->Nz_reio-1-index_z) / (double)(ptw->Nz_reio));
-  }
+    /* Initial z, and the z at which we switch to linear sampling */
+    zinitial = ppr->thermo_z_initial;
+    zlinear  = ppr->thermo_z_linear;
 
-  for (index_tau=0; index_tau < pth->tt_size; index_tau++) {
-    class_call(background_tau_of_z(pba,
-                                   pth->z_table[index_tau],
-                                   pth->tau_table+index_tau),
-               pba->error_message,
-               pth->error_message);
+    /* -> Between z_initial and z_linear, log-spaced */
+    for (index_z=0; index_z <ptw->Nz_reco_log; index_z++) {
+      pth->z_table[(pth->tt_size-1) - index_z] = -(-exp((log(zinitial)-log(zlinear))*(double)(ptw->Nz_reco_log-1-index_z) / (double)(ptw->Nz_reco_log-1)+log(zlinear)));
+    }
+
+    /* -> Between z_linear and reionization_z_start_max, linear-spaced */
+    for (index_z=0; index_z <ptw->Nz_reco_lin; index_z++) {
+      pth->z_table[(pth->tt_size-1)-(index_z+ptw->Nz_reco_log)] = -(-(zlinear-ppr->reionization_z_start_max) * (double)(ptw->Nz_reco_lin-1-index_z) / (double)(ptw->Nz_reco_lin) - ppr->reionization_z_start_max);
+    }
+
+    /* -> Between reionization_z_start_max and 0, reionization sampling */
+    for (index_z=0; index_z <ptw->Nz_reio; index_z++) {
+      pth->z_table[(pth->tt_size-1)-(index_z+ptw->Nz_reco)] = -(-ppr->reionization_z_start_max * (double)(ptw->Nz_reio-1-index_z) / (double)(ptw->Nz_reio));
+    }
+
+    for (index_tau=0; index_tau < pth->tt_size; index_tau++) {
+      class_call(background_tau_of_z(pba,
+                                     pth->z_table[index_tau],
+                                     pth->tau_table+index_tau),
+                 pba->error_message,
+                 pth->error_message);
+    }
   }
 
   /** - store initial value of conformal time in the structure */
@@ -1601,7 +1735,7 @@ int thermodynamics_solve(
   interval_number = ptw->ptdw->ap_size;
   /* integration starts at z_ini and ends at z_end */
   interval_limit[0]= mz_output[0];
-  interval_limit[ptw->ptdw->ap_size] = mz_output[ptw->Nz_tot-1];
+  interval_limit[ptw->ptdw->ap_size] = mz_output[pth->tt_size-1]; /* use tt_size: Nz_tot is synced in DDDC branch */
   /* each interval ends with the proper ending redshift of its approximation */
   for (index_ap=0; index_ap < ptw->ptdw->ap_size-1; index_ap++) {
     interval_limit[index_ap+1] = -ptw->ptdw->ap_z_limits[index_ap];
@@ -2006,20 +2140,29 @@ int thermodynamics_vector_init(
     ptdw->require_He = _FALSE_;
   }
   else if (ptw->has_ap_idmtca == _TRUE_ && ptdw->ap_current == ptdw->index_ap_brec) {
-    /* Copy old values */
-    ptv->y[ptv->index_ti_D_Tmat] = ptdw->ptv->y[ptdw->ptv->index_ti_D_Tmat];
-    ptv->dy[ptv->index_ti_D_Tmat] = ptdw->ptv->dy[ptdw->ptv->index_ti_D_Tmat];
+    /* DDDC: ptdw->ptv is NULL when we start late and skip the idmtca phase entirely */
+    if (pba->integration_mode == 1 && ptdw->ptv == NULL) {
+      /* No prior phase to copy from — initialize T_mat = T_gamma, D_Tmat = 0 */
+      ptv->y[ptv->index_ti_D_Tmat] = 0.0;
+      ptv->dy[ptv->index_ti_D_Tmat] = 0.0;
+      ptdw->Tmat = ptw->Tcmb * (1. + z);
+    }
+    else {
+      /* Normal path: copy carried values from the idmtca phase */
+      ptv->y[ptv->index_ti_D_Tmat] = ptdw->ptv->y[ptdw->ptv->index_ti_D_Tmat];
+      ptv->dy[ptv->index_ti_D_Tmat] = ptdw->ptv->dy[ptdw->ptv->index_ti_D_Tmat];
 
-    /* Set initial conditions */
+      /* Free the old vector and its indices */
+      class_call(thermodynamics_vector_free(ptdw->ptv),
+                 pth->error_message,
+                 pth->error_message);
+    }
+
+    /* Set initial conditions for IDM temperature */
     ptv->y[ptv->index_ti_T_idm] = pba->T_cmb * (1.+z);
     /* If we instead have idr tight coupling, we choose instead */
     if ((pth->has_idm_dr == _TRUE_) && pth->n_index_idm_dr > 0)
       ptv->y[ptv->index_ti_T_idm] = pba->T_idr * (1.+z);
-
-    /* Free the old vector and its indices */
-    class_call(thermodynamics_vector_free(ptdw->ptv),
-               pth->error_message,
-               pth->error_message);
 
     /* Copy the new vector into the position of the old one */
     ptdw->ptv = ptv;
@@ -2534,6 +2677,18 @@ int thermodynamics_derivs(
                           ) {
   /** Summary: */
 
+  /* DEBUG: stiffness detector — if this fires the ODE solver is hung */
+  // {
+  //   static long deriv_calls = 0;
+  //   deriv_calls++;
+  //   if (deriv_calls % 10000 == 0) {
+  //     double z_now = -mz; /* mz = -z */
+  //     printf("DEBUG: thermodynamics_derivs called %ld times. Current z = %e\n",
+  //            deriv_calls, z_now);
+  //     fflush(stdout);
+  //   }
+  // }
+
   /** Define local variables */
   /* Index for iterating over derivatives */
   int index_ti;
@@ -2593,17 +2748,65 @@ int thermodynamics_derivs(
              pba->error_message,
              error_message);
 
-  /* Hz is H in inverse seconds (while pvecback returns [H0/c] in inverse Mpcs) */
-  Hz = pvecback[pba->index_bg_H] * _c_ / _Mpc_over_m_;
+  /* Hz is H in inverse seconds (while pvecback returns [H0/c] in inverse Mpcs).
+     When DDDC is active (r_s > 0), background_functions already writes the
+     centrally-capped proper Hubble rate into index_bg_H_proper; use it
+     directly to avoid double-applying the dilation factor. */
+  if (pba->r_s > 0.) {
+    Hz = pvecback[pba->index_bg_H_proper] * _c_ / _Mpc_over_m_;
+  } else {
+    Hz = pvecback[pba->index_bg_H] * _c_ / _Mpc_over_m_;
+  }
+
+  /* DDDC safety: if Hz is non-finite, freeze all derivatives and let the
+     evolver recover gracefully. */
+  if (pba->r_s > 0. && !isfinite(Hz)) {
+    for (index_ti = 0; index_ti < ptdw->ptv->ti_size; index_ti++)
+      dy[index_ti] = 0.0;
+    return _SUCCESS_;
+  }
+
+  /* DDDC: separate the physical expansion variable from the observed redshift.
+   *
+   * The ODE integration variable is z_obs (DDDC observed redshift, including
+   * gravitational time-dilation).  But the atomic physics — baryon number
+   * density, local photon temperature, and matter temperature reference — all
+   * depend only on the physical scale factor a via:
+   *
+   *   n_H   = n_H0 / a^3          (comoving baryon conservation)
+   *   T_rad = T_cmb / a            (adiabatic photon cooling in proper volume)
+   *
+   * The DDDC dilation factor D(a) shifts the OBSERVED frequency/temperature
+   * of photons reaching us TODAY, but does NOT change the local photon energy
+   * at the emission epoch (local observers see T_cmb / a regardless of D).
+   *
+   * The chain-rule factor 1/(1+z) in HyRec/RECFAST remains z_obs because the
+   * ODE integrates over dz_obs (see hyrec_dx_H_dz, recfast_dx_H_dz).
+   * The Gaussian correction in RECFAST (log(1+z) terms) also uses z_obs
+   * as a minor approximation — these are small correction factors calibrated
+   * against FLRW and their residual error is second-order in (z_obs − z_phys). */
+  double z_phys;   /* z = 1/a − 1: physical expansion redshift for atomic physics */
+  if (pba->r_s > 0. || pba->a_rs > 0.) {
+    double a_phys = pvecback[pba->index_bg_a];
+    z_phys = 1.0 / a_phys - 1.0;
+  }
+  else {
+    z_phys = z;   /* standard FLRW: z_obs == z_phys */
+  }
 
   /* Total number density of Hydrogen nuclei in SI units */
-  nH = ptw->SIunit_nH0 * (1.+z) * (1.+z) * (1.+z);
+  nH = ptw->SIunit_nH0 * (1.+z_phys) * (1.+z_phys) * (1.+z_phys);
 
   /* Photon temperature in Kelvins. Modify this for some non-trivial photon temperature changes */
-  Trad = ptw->Tcmb * (1.+z);
+  Trad = ptw->Tcmb * (1.+z_phys);
 
-  /** Set Tmat from the evolver (it is always evolved) and store it in the workspace. */
-  Tmat = y[ptv->index_ti_D_Tmat] + ptw->Tcmb*(1.+z);
+  /** Set Tmat from the evolver (it is always evolved) and store it in the workspace.
+   *  D_Tmat = T_mat − T_photon is the evolved differential; T_photon reference = T_cmb/a. */
+  Tmat = y[ptv->index_ti_D_Tmat] + ptw->Tcmb*(1.+z_phys);
+
+  /* DDDC: extreme adiabatic cooling can drive Tmat negative, causing NaN in
+     atomic rate coefficients. Clamp to a physically meaningful floor. */
+  if (Tmat < 1e-10) Tmat = 1e-10;
 
   /* For varying fundamental constants (according to 1705.03925) */
   if (pth->has_varconst == _TRUE_) {

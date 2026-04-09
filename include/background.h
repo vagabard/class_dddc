@@ -123,6 +123,63 @@ struct background
   enum varconst_dependence varconst_dep; /**< dependence of the varying fundamental constants as a function of time */
   double varconst_transition_redshift; /**< redshift of transition between varied fundamental constants and normal fundamental constants in the 'varconst_instant' case*/
 
+  /** DDDC (Density Driven Dilation Cosmology) model parameters */
+  double M0;            /**< total mass of the universe [kg]; when > 0 and r_s == 0,
+                             r_s is derived via r_s = 2*G*M0 / c^2, then normalised to Hubble units */
+  double a_rs;          /**< Schwarzschild scale factor */
+  double k_dil;         /**< dilation scaling coefficient */
+  double a_min;         /**< minimum scale factor (Buchdahl limit) — legacy, do not use for DDDC */
+  double a_min_dddc;    /**< scale factor at which DDDC time-dilation physics activates (does not alter a_ini) */
+  int dilation_mode;    /**< 1 = Schwarzschild Interior, 2 = Exponential */
+  int integration_mode; /**< 0 = proper time, 1 = coordinate time */
+  double n_exp;         /**< power-law exponent for scale factor evolution a(tc) */
+  double r_s;           /**< Schwarzschild radius in Interior Schwarzschild DDDC */
+  double R_geom;        /**< geometric radius of the interior object (must exceed r_s) */
+  double dddc_transition_frac; /**< DDDC blending width as fraction of a_min_dddc (default 0.3) */
+  double dddc_k_blend;         /**< DDDC sigmoid sharpness k_blend [1/a units]; overrides dddc_transition_frac
+                                     when > 0. transition_width = 1/k_blend. Default 0 (use fraction-based width). */
+  short  force_amin_to_rs;    /**< if _TRUE_, clamp DDDC-internal a to r_s when a < a_min_dddc,
+                                   preventing ODE blow-up below the Schwarzschild activation boundary */
+  short  skip_buchdahl_check; /**< if _TRUE_, suppress all Buchdahl-limit and R_geom > r_s checks.
+                                   Allows exploration of super-Buchdahl geometries (R_geom < r_s)
+                                   for research purposes. inv_D is regularized so the ODE survives. */
+  short  use_soft_transition;  /**< computed flag: _TRUE_ when DDDC soft blending is active (r_s > 0),
+                                     set automatically by background_checks(). Mirrors the blending logic. */
+
+  /** DDDC v2 — pure Density Driven Dilation Cosmology (no blending with FLRW)
+   *
+   *  Activated when M0_dddc > 0, R_geom_dddc > 0, and a_sat_dddc > 0.
+   *  H(a) is driven entirely by the maximum compaction limit; the standard
+   *  FLRW Friedmann sum rule is bypassed and K is forced to zero.
+   *
+   *  Lapse function: N(a) = N_min + (1 - N_min) * a^3 / (a^3 + a_sat^3)
+   *  Proper Hubble:  H(a) = H_base * a^p / N(a),  p = n_exp - 1.5
+   */
+  double M0_dddc;         /**< total mass of the universe [kg] */
+  double R_geom_dddc;     /**< geometric radius of the universe [Gpc] */
+  double N_min_dddc;      /**< minimum lapse function value (time-dilation cap, 0 < N_min <= 1) */
+  double a_sat_dddc;      /**< slack threshold scale factor: N saturates near a_sat */
+  double n_exp_dddc;      /**< expansion scaling exponent (sets power-law index p = n_exp - 1.5) */
+  short  has_dddc;        /**< _TRUE_ when DDDC v2 compaction model is active */
+
+  /** Pre-computed DDDC v2 derived quantities — set during input_read_parameters_general() */
+  double H_base_dddc;     /**< base Hubble rate [Mpc^-1], derived from rho0 = M0 / R_geom^3 via
+                               H_base = sqrt(8 pi G rho0 / 3), then converted to Mpc^-1 */
+  double p_dddc;          /**< combined power-law index: p = n_exp_dddc - 1.5 */
+
+  /** DDDC v4 — Bounded Elastic Continuum (BEC) model */
+  double a_eq_bec;      /**< scale factor at BEC equilibrium epoch */
+  double P_max_bec;     /**< maximum restoring pressure [Mpc^-2] */
+  double k_bec;         /**< saturation rate constant */
+  double n_bec;         /**< power-law exponent for restoring pressure */
+  double Gamma_min_bec; /**< minimum dilation factor (floor) */
+  double alpha_bec;     /**< dilation-density coupling coefficient */
+  double m_bec;         /**< stiffening exponent */
+  short  has_dddc_bec;  /**< _TRUE_ when BEC model is active */
+  /** Pre-computed BEC derived quantities */
+  int    index_bg_rho_str;  /**< BEC STR fluid density in bg vector */
+  int    index_bi_rho_str;  /**< BEC STR fluid density in integration vector */
+
   //@}
 
 
@@ -191,6 +248,9 @@ struct background
   int index_bg_p_tot_prime;   /**< Conf. time derivative of total pressure */
 
   int index_bg_Omega_r;       /**< relativistic density fraction (\f$ \Omega_{\gamma} + \Omega_{\nu r} \f$) */
+
+  int index_bg_D_dilation;    /**< DDDC time-dilation factor D(a) = 1/inv_D */
+  int index_bg_H_proper;      /**< DDDC proper-time Hubble rate H_safe */
 
   /* end of vector in normal format, now quantities in long format */
 
@@ -517,6 +577,27 @@ extern "C" {
                              struct background *pba,
                              int number_of_titles,
                              double *data);
+
+  int background_dilation_factor(
+                                 struct background * pba,
+                                 double a,
+                                 double * D,
+                                 ErrorMsg error_message
+                                 );
+
+  int background_dddc_z_of_a(
+                              struct background * pba,
+                              double a,
+                              double * z_obs,
+                              ErrorMsg error_message
+                              );
+
+  int background_dddc_a_of_z(
+                              struct background * pba,
+                              double z_obs,
+                              double * a,
+                              ErrorMsg error_message
+                              );
 
   int background_derivs(
                         double loga,

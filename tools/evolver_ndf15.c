@@ -302,9 +302,17 @@ int evolver_ndf15(
   done = _FALSE_;
   at_hmin = _FALSE_;
   while (done==_FALSE_){
-    /**class_test(stepstat[2] > 1e5, error_message,
-           "Too many steps in evolver! Current stepsize:%g, in interval: [%g:%g]\n",
-           absh,t0,tfinal);*/
+    /* DDDC kill switch: abort if ODE is clearly derailed.
+       Raised from 50k to 500k — DDDC transition requires more evaluations
+       due to the rapid change in conformal Hubble rate at the blending region. */
+    if (stepstat[2] > 500000) {
+      class_stop(error_message,
+                 "ODE Solver Derailed: Exceeded 500,000 function evaluations. "
+                 "System is too stiff or variables overflowed. "
+                 "Current stepsize: %g, interval: [%g:%g]",
+                 absh, t0, tfinal);
+      return _FAILURE_;
+    }
     maxtmp = MAX(hmin,absh);
     absh = MIN(hmax, maxtmp);
     if (fabs(absh-hmin)<100*eps){
@@ -1319,12 +1327,17 @@ int numjac(
       group = jac->col_group[j];
       Fdiff_new = 0.0;
       Fdiff_absrm = 0.0;
+      /* Safe default: ydel_Fdel[0] is NULL, so Rowmax must point to a valid row.
+         Rowmax is malloc'd (not calloc'd), so initialize before the inner loop. */
+      nj_ws->Rowmax[j+1] = Ap[j] < Ap[j+1] ? Ai[Ap[j]]+1 : 1;
+      nj_ws->Difmax[j+1] = 0.0;
       for(i=Ap[j];i<Ap[j+1];i++){
         /* Loop over rows in the sparse matrix */
         row = Ai[i]+1;
         /* Do I want to construct the full jacobian? No, that is ugly..*/
         Fdiff_absrm = MAX(Fdiff_absrm,fabs(Fdiff_new));
         Fdiff_new = nj_ws->ydel_Fdel[row][group+1]-fval[row]; /*Remember to access the column of the corresponding group */
+        if (!isfinite(Fdiff_new)) Fdiff_new = 0.0; /* NaN/Inf from singular region: treat as zero diff */
         if (fabs(Fdiff_new)>=Fdiff_absrm){
           nj_ws->Rowmax[j+1] = row;
           nj_ws->Difmax[j+1] = Fdiff_new;
@@ -1341,9 +1354,14 @@ int numjac(
     for(j=1;j<=neq;j++){
       Fdiff_new = 0.0;
       Fdiff_absrm = 0.0;
+      /* Safe default: ydel_Fdel[0] is NULL, so Rowmax must point to a valid row.
+         Rowmax is malloc'd (not calloc'd), so initialize before the inner loop. */
+      nj_ws->Rowmax[j] = 1;
+      nj_ws->Difmax[j] = 0.0;
       for(i=1;i<=neq;i++){
         Fdiff_absrm = MAX(fabs(Fdiff_new),Fdiff_absrm);
         Fdiff_new = nj_ws->ydel_Fdel[i][j] - fval[i];
+        if (!isfinite(Fdiff_new)) Fdiff_new = 0.0; /* NaN/Inf from singular region: treat as zero diff */
         dFdy[i][j] = Fdiff_new/nj_ws->del[j];
         /*Find row maximums:*/
         if(fabs(Fdiff_new)>=Fdiff_absrm){
