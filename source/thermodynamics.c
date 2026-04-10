@@ -937,7 +937,7 @@ int thermodynamics_workspace_init(
    *  Entries that are already at z = 0 (reionisation endpoint) are left
    *  untouched; the idmtca entry is also skipped (DM-baryon decoupling is a
    *  local process whose epoch does not shift in DDDC observed-redshift space). */
-  if (pba->r_s > 0. || pba->a_rs > 0.) {
+  if (pba->r_s > 0. || pba->a_rs > 0. || pba->has_dddc == _TRUE_ || pba->has_dddc_bec == _TRUE_) {
     int index_ap_remap;
     for (index_ap_remap = 0; index_ap_remap < ptw->ptdw->ap_size; index_ap_remap++) {
 
@@ -1211,7 +1211,7 @@ int thermodynamics_lists(
    *  where a_thermo_start = 1 / (1 + z_thermo_initial).  Points before
    *  bg_start correspond to epochs earlier than thermodynamics cares about. */
 
-  if (pba->r_s > 0. || pba->a_rs > 0.) {
+  if (pba->r_s > 0. || pba->a_rs > 0. || pba->has_dddc == _TRUE_ || pba->has_dddc_bec == _TRUE_) {
     /* DDDC branch: anchor to background loga grid */
     double loga_thermo_start = log(1.0 / (1.0 + ppr->thermo_z_initial));
     while (bg_start < pba->bt_size - 1 &&
@@ -1233,7 +1233,7 @@ int thermodynamics_lists(
 
   /** - define time sampling */
 
-  if (pba->r_s > 0. || pba->a_rs > 0.) {
+  if (pba->r_s > 0. || pba->a_rs > 0. || pba->has_dddc == _TRUE_ || pba->has_dddc_bec == _TRUE_) {
 
     /** DDDC: copy z_obs and tau directly from the background table.
      *
@@ -2786,7 +2786,7 @@ int thermodynamics_derivs(
    * as a minor approximation — these are small correction factors calibrated
    * against FLRW and their residual error is second-order in (z_obs − z_phys). */
   double z_phys;   /* z = 1/a − 1: physical expansion redshift for atomic physics */
-  if (pba->r_s > 0. || pba->a_rs > 0.) {
+  if (pba->r_s > 0. || pba->a_rs > 0. || pba->has_dddc == _TRUE_ || pba->has_dddc_bec == _TRUE_) {
     double a_phys = pvecback[pba->index_bg_a];
     z_phys = 1.0 / a_phys - 1.0;
   }

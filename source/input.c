@@ -2336,6 +2336,9 @@ int input_read_parameters_general(struct file_content * pfc,
   class_read_int("dilation_mode",pba->dilation_mode);
   class_read_int("integration_mode",pba->integration_mode);
   class_read_double("n_exp",pba->n_exp);
+  class_read_double("k_expansion",pba->k_expansion);
+  class_read_double("n_expansion",pba->n_expansion);
+  class_read_double("sigma_redshift",pba->sigma_redshift);
   class_read_double("r_s",pba->r_s);
   class_read_double("R_geom",pba->R_geom);
   class_read_double("dddc_transition_frac",pba->dddc_transition_frac);
@@ -2353,6 +2356,11 @@ int input_read_parameters_general(struct file_content * pfc,
   class_read_double("N_min_dddc",  pba->N_min_dddc);
   class_read_double("a_sat_dddc",  pba->a_sat_dddc);
   class_read_double("n_exp_dddc",  pba->n_exp_dddc);
+
+  class_test((pba->sigma_redshift < 0.) || (pba->sigma_redshift > 1.),
+             errmsg,
+             "sigma_redshift=%e is out of range [0,1].",
+             pba->sigma_redshift);
 
   if (pba->M0_dddc > 0. && pba->R_geom_dddc > 0. && pba->a_sat_dddc > 0.) {
     pba->has_dddc = _TRUE_;
@@ -2373,13 +2381,29 @@ int input_read_parameters_general(struct file_content * pfc,
     /* Combined power-law index p = n_exp - 1.5 */
     pba->p_dddc = pba->n_exp_dddc - 1.5;
 
+    /* Coordinate-time expansion law defaults for H(t)=k*t^n. */
+    if (pba->k_expansion < -1e299) {
+      pba->k_expansion = pba->H_base_dddc;
+    }
+    if (pba->n_expansion < -1e299) {
+      pba->n_expansion = pba->n_exp_dddc;
+    }
+
+    class_test(!isfinite(pba->k_expansion) || pba->k_expansion == 0.,
+               errmsg,
+               "DDDC requires non-zero k_expansion in H(t)=k*t^n.");
+    class_test(!isfinite(pba->n_expansion) || pba->n_expansion <= -1.0,
+               errmsg,
+               "DDDC requires n_expansion > -1 to keep t(a) well-defined; got n_expansion=%e.",
+               pba->n_expansion);
+
     if (pba->background_verbose > 0)
       printf(" -> DDDC v2 active:"
              " M0=%e kg, R_geom=%e Gpc, N_min=%e, a_sat=%e, n_exp=%e\n"
-             "            -> H_base=%e Mpc^-1, p=%e\n",
+             "            -> H_base=%e Mpc^-1, p=%e, k_expansion=%e, n_expansion=%e, sigma_redshift=%e\n",
              pba->M0_dddc, pba->R_geom_dddc, pba->N_min_dddc,
              pba->a_sat_dddc, pba->n_exp_dddc,
-             pba->H_base_dddc, pba->p_dddc);
+             pba->H_base_dddc, pba->p_dddc, pba->k_expansion, pba->n_expansion, pba->sigma_redshift);
   }
 
   /** 11e) DDDC v4 — Bounded Elastic Continuum (BEC) model
@@ -5997,6 +6021,9 @@ int input_default_params(struct background *pba,
   pba->dilation_mode = 1;
   pba->integration_mode = 0;
   pba->n_exp = 1.0;
+  pba->k_expansion = -1e300;
+  pba->n_expansion = -1e300;
+  pba->sigma_redshift = 1.0;
   pba->r_s = 0.0;
   pba->R_geom = 0.0;
   pba->dddc_transition_frac = 0.3;

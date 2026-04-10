@@ -133,6 +133,9 @@ struct background
   int dilation_mode;    /**< 1 = Schwarzschild Interior, 2 = Exponential */
   int integration_mode; /**< 0 = proper time, 1 = coordinate time */
   double n_exp;         /**< power-law exponent for scale factor evolution a(tc) */
+  double k_expansion;   /**< coordinate-time Hubble prefactor in H(t)=k*t^n */
+  double n_expansion;   /**< coordinate-time Hubble exponent in H(t)=k*t^n */
+  double sigma_redshift;/**< hybrid redshift mixing: 1=expansion-only, 0=dilation-only */
   double r_s;           /**< Schwarzschild radius in Interior Schwarzschild DDDC */
   double R_geom;        /**< geometric radius of the interior object (must exceed r_s) */
   double dddc_transition_frac; /**< DDDC blending width as fraction of a_min_dddc (default 0.3) */
@@ -177,7 +180,7 @@ struct background
   double m_bec;         /**< stiffening exponent */
   short  has_dddc_bec;  /**< _TRUE_ when BEC model is active */
   /** Pre-computed BEC derived quantities */
-  int    index_bg_rho_str;  /**< BEC STR fluid density in bg vector */
+  int    index_bg_rho_str;  /**< STR closure density in bg vector (BEC-integrated or algebraic remainder) */
   int    index_bi_rho_str;  /**< BEC STR fluid density in integration vector */
 
   //@}

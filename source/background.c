@@ -158,56 +158,6 @@ static inline double dddc_regularize_inv_D(double inv_D_raw) {
   return sqrt(inv_D_raw * inv_D_raw + DDDC_INV_D_MIN * DDDC_INV_D_MIN);
 }
 
-/* Soft maximum for BEC dilation factor Gamma(a).
- * Replaces fmax(Gamma_pow, Gamma_min) with a C-infinity smooth equivalent:
- *   bec_soft_gamma(x, m) = sqrt(x^2 + m^2)
- * which satisfies: ≈ m for x << m (at the floor), ≈ x for x >> m (power-law regime).
- * The sharp kink in fmax at x = m forces NDF15 to take machine-precision steps there;
- * this smooth version eliminates that C1-discontinuity. */
-static inline double bec_soft_gamma(double gamma_pow, double gamma_min) {
-  return sqrt(gamma_pow * gamma_pow + gamma_min * gamma_min);
-}
-
-/* Soft minimum of (g, 1.0) for the BEC ceiling Gamma <= 1.
- * Replaces fmin(g, 1.0) with a C-infinity smooth equivalent:
- *   bec_soft_ceil(g, eps) = (g + 1 - sqrt((g-1)^2 + eps^2)) / 2
- * which satisfies: ≈ g for g << 1 (pass-through), ≈ 1 for g >> 1 (ceiling).
- * The sharp kink in fmin at g = 1 causes NDF15 to take machine-precision steps
- * near the crossover; this smooth version eliminates that C1-discontinuity.
- * Keep eps very small: large eps can drive this expression slightly negative
- * when g << 1, which is unphysical for a dilation factor. */
-#define GAMMA_CEIL_EPS 1e-6
-static inline double bec_soft_ceil(double g) {
-  double d, root, value;
-
-  /* Guard against inf-inf cancellation in the large-g tail:
-   * for g >> 1, 0.5*(g+1-sqrt((g-1)^2+eps^2)) is mathematically ~1 but can
-   * evaluate to NaN numerically if both terms overflow to +inf. */
-  if (!isfinite(g)) {
-    return 1.0;
-  }
-
-  d = g - 1.0;
-  root = sqrt(d * d + GAMMA_CEIL_EPS * GAMMA_CEIL_EPS);
-
-  if (d >= 0.0) {
-    /* Stable form in the cancellation-prone branch:
-     * value = 1 - 0.5*(root-d), with (root-d)=eps^2/(root+d). */
-    double denom = root + d;
-    if (denom > 0.0) {
-      value = 1.0 - 0.5 * (GAMMA_CEIL_EPS * GAMMA_CEIL_EPS) / denom;
-    }
-    else {
-      value = 1.0;
-    }
-  }
-  else {
-    value = 0.5 * (g + 1.0 - root);
-  }
-
-  return fmax(value, 1e-30);
-}
-
 /* Smooth C-infinity approximation of max(x,0). */
 static inline double bec_soft_positive(double x) {
   return 0.5 * (x + sqrt(x * x + BEC_RHO_EFF_EPS * BEC_RHO_EFF_EPS));
@@ -223,7 +173,8 @@ static inline double bec_soft_max(double x, double y, double eps) {
 static inline double bec_gamma_raw(struct background * pba, double a) {
   double ratio_bec = (pba->a_eq_bec > 0.) ? (a / pba->a_eq_bec) : 1.0;
   double gamma_pow = pow(ratio_bec, pba->alpha_bec) * pow(a, pba->m_bec);
-  return bec_soft_ceil(bec_soft_gamma(gamma_pow, pba->Gamma_min_bec));
+  double gamma_raw = sqrt(gamma_pow * gamma_pow + pba->Gamma_min_bec * pba->Gamma_min_bec);
+  return gamma_raw;
 }
 
 /* Effective BEC dilation normalized so Gamma_eff(a=1)=1 exactly. */
@@ -233,7 +184,7 @@ static inline double bec_gamma_eff(struct background * pba, double a) {
 }
 
 /* Numerically robust d(ln Gamma_raw)/d(ln a).
- * Central differencing avoids analytic inf/inf forms in the saturated regime. */
+ * Central differencing keeps this stable over wide parameter scans. */
 static inline double bec_dln_gamma_dlna(struct background * pba, double a) {
   const double dlna = 1e-6;
   double a_plus = a * exp(dlna);
@@ -368,20 +319,20 @@ static void background_bec_debug_log(double a,
       }
 
       fprintf(stderr,
-              "DEBUG BEC NaN/Inf: a=%e H=%e rho_str=%e dy_rho_str=%e P_max=%e\n",
+              "DEBUG BEC anomaly: a=%e H=%e rho_str=%e dy_rho_str=%e P_max=%e\n",
               a, H, rho_str, dy_rho_str, P_max);
       fflush(stderr);
     }
     else if ((anomaly_streak % BEC_DEBUG_PRINT_EVERY) == 0) {
       fprintf(stderr,
-              "DEBUG BEC NaN/Inf ongoing: streak=%d a=%e H=%e rho_str=%e dy_rho_str=%e P_max=%e\n",
+              "DEBUG BEC anomaly ongoing: streak=%d a=%e H=%e rho_str=%e dy_rho_str=%e P_max=%e\n",
               anomaly_streak, a, H, rho_str, dy_rho_str, P_max);
       fflush(stderr);
     }
   }
   else if (anomaly_streak > 0) {
     fprintf(stderr,
-            "DEBUG BEC NaN/Inf recovered after %d anomalous steps\n",
+            "DEBUG BEC anomaly recovered after %d anomalous steps\n",
             anomaly_streak);
     fflush(stderr);
     anomaly_streak = 0;
@@ -1050,62 +1001,27 @@ int background_functions(
     pvecback[pba->index_bg_H_prime]    = H_prime_dddc;
   }
 
-  /** - DDDC v2: pure compaction model — replace H and H' with the analytically-derived
-   *    lapse-function-regulated power law.  Active when has_dddc == _TRUE_.
-   *
-   *  Physics:
-   *    Lapse function:  N(a) = N_min + (1 - N_min) * a^3 / (a^3 + a_sat^3)
-   *    dN/da          = (1 - N_min) * 3 a^2 a_sat^3 / (a^3 + a_sat^3)^2
-   *    Proper Hubble:   H(a) = H_base * a^p / N(a),   p = n_exp - 1.5
-   *
-   *  H_prime stored in index_bg_H_prime is dH/d(conformal time tau):
-   *    dH/dtau = a^2 H * (dH/da) = a H^2 * [p - a*(dN/da)/N(a)]
-   *
-   *  NaN guard: a_ini is floored at 1e-14 elsewhere; when p < 0 and a ~ a_ini,
-   *  pow(a, p) is large but finite.  N(a) -> N_min > 0 regularises the ratio. */
-  if (pba->has_dddc == _TRUE_) {
+  /** - DDDC coordinate-time power law:
+   *      H(t_coord) = k_expansion * t_coord^n_expansion
+   *      t_coord(a) = [((n+1)/k) * ln(a)]^(1/(n+1))
+   *    and STR closure density is injected as the residual budget term. */
+  if (pba->has_dddc == _TRUE_ && pba->has_dddc_bec == _FALSE_) {
+    double t_source = ((pba->n_expansion + 1.0) / pba->k_expansion) * log(a);
 
-    /* --- Unpack pre-computed DDDC v2 parameters --- */
-    double H_base  = pba->H_base_dddc;   /* [Mpc^-1]       */
-    double p       = pba->p_dddc;        /* n_exp - 1.5     */
-    double N_min   = pba->N_min_dddc;    /* lapse floor     */
-    double a_sat   = pba->a_sat_dddc;    /* slack threshold */
+    {
+      double t_coord = pow(fabs(t_source), 1.0 / (pba->n_expansion + 1.0));
+      double H_dddc = pba->k_expansion * pow(t_coord, pba->n_expansion);
+      double H_prime_dddc = a * H_dddc * pba->n_expansion / fmax(t_coord, 1e-30);
+      double rho_b = pvecback[pba->index_bg_rho_b];
+      double rho_str = (3.0 * H_dddc * H_dddc / (8.0 * _PI_ * _G_)) - (rho_b + rho_r);
 
-    /* --- Pre-compute denominator terms for the lapse function --- */
-    double a3      = a * a * a;
-    double a_sat3  = a_sat * a_sat * a_sat;
-    double denom   = a3 + a_sat3;           /* a^3 + a_sat^3          */
-    double denom2  = denom * denom;         /* (a^3 + a_sat^3)^2      */
+      pvecback[pba->index_bg_H] = H_dddc;
+      pvecback[pba->index_bg_H_prime] = H_prime_dddc;
+      pvecback[pba->index_bg_rho_str] = rho_str;
 
-    /* --- Lapse function N(a) and its derivative dN/da --- */
-    double N_a     = N_min + (1. - N_min) * a3 / denom;
-    double dN_da   = (1. - N_min) * 3. * a * a * a_sat3 / denom2;
-
-    /* --- Proper Hubble rate H(a) = H_base * a^p / N(a) ---
-     * Guard: if a is at floor (1e-14) and p < 0, pow still finite. */
-    double a_p     = pow(a, p);             /* a^p                    */
-    double H_dddc  = H_base * a_p / N_a;   /* [Mpc^-1]               */
-
-    /* --- Conformal Hubble derivative H' = d(aH)/d(eta) stored in index_bg_H_prime.
-     *
-     * mathcal{H} = aH, so:
-     *   mathcal{H}' = d(aH)/deta = (da/deta)*H + a*(dH/deta)
-     *              = a^2*H*H + a*(a^2*H*(dH/da))
-     *              = a^2*H^2 * [1 + a*(dH/da)/H]
-     *
-     * With dH/da = H*(p/a - dN/da/N):
-     *   a*(dH/da)/H = p - a*dN/da/N
-     *
-     * Therefore: mathcal{H}' = a^2 * H^2 * (1 + p - a*dN/da/N)
-     *
-     * Unit check: H_base was computed in SI [s^-1] then converted to Mpc^-1 via
-     *   H_base_dddc = H_base_si * _Mpc_over_m_ / _c_
-     * so H_dddc is in [Mpc^-1] and H_prime is in [Mpc^-2], consistent with CLASS. */
-    double H_prime_dddc_v2 = a * a * H_dddc * H_dddc * (1.0 + p - a * dN_da / N_a);
-
-    /* --- Override standard FLRW values --- */
-    pvecback[pba->index_bg_H]       = H_dddc;
-    pvecback[pba->index_bg_H_prime] = H_prime_dddc_v2;
+      /* Keep the scalar energy accounting closed for downstream thermodynamics/distances. */
+      rho_tot = rho_b + rho_r + rho_str;
+    }
   }
 
   /* DDDC v4 BEC: override the Friedmann expansion engine.
@@ -1146,10 +1062,11 @@ int background_functions(
     /* H_prime = dH_coord/dtau = a * H_coord * dH_coord/dlna.
      * From H_coord = H_proper/Gamma_eff and d(H_proper)/dlna = -3(rho+p)/(2*H_proper):
      *   dH_coord/dlna = -3(rho+p)/(2*H_proper*Gamma) - H_coord*d(lnGamma)/dlna
-     * d(lnGamma)/dlna is computed via chain rule through the soft-floor then soft-ceiling:
-     *   d(Gamma_floor)/dlna = Gamma_pow^2 * (alpha+m) / Gamma_floor
-     *   d(Gamma_ceil)/d(Gamma_floor) = (1 - (Gamma_floor-1)/sqrt((Gamma_floor-1)^2+eps^2)) / 2
-     *   d(lnGamma_eff)/dlna = d(lnGamma_raw)/dlna (Gamma_today is a constant in a)
+     * Gamma_eff follows the power-law-plus-floor relation:
+     *   Gamma_pow = (a/a_eq_bec)^alpha_bec * a^m_bec
+     *   Gamma_raw = sqrt(Gamma_pow^2 + Gamma_min_bec^2)
+     *   Gamma_eff = Gamma_raw(a)/Gamma_raw(1)
+     * d(lnGamma_eff)/dlna = d(lnGamma_raw)/dlna since Gamma_raw(1) is constant in a.
      * Both terms of H_prime are negative, so H_prime is always negative as physically required. */
     double dlnGamma_dlna      = bec_dln_gamma_dlna(pba, a);
     double H_prime_bec = -1.5 * a * (rho_tot + p_tot) / (Gamma_eff * Gamma_eff)
@@ -1692,7 +1609,7 @@ int background_indices(
   class_define_index(pba->index_bg_H_proper,   (pba->r_s > 0.), index_bg, 1);
 
   /* - index for BEC STR fluid density */
-  class_define_index(pba->index_bg_rho_str, pba->has_dddc_bec, index_bg, 1);
+  class_define_index(pba->index_bg_rho_str, (pba->has_dddc_bec == _TRUE_) || (pba->has_dddc == _TRUE_), index_bg, 1);
 
   /* - end of indices in the normal vector of background values */
   pba->bg_size_normal = index_bg;
@@ -3130,8 +3047,36 @@ int background_initial_conditions(
       source_integral *= da;
     }
 
-    pvecback_integration[pba->index_bi_rho_str] =
-      (rho_str_today - source_integral) / pow(a, 3);
+    {
+      double rho_str_initial_numerator = rho_str_today - source_integral;
+
+      class_test(!isfinite(rho_str_initial_numerator),
+                 pba->error_message,
+                 "DDDC-BEC anchor back-propagation produced non-finite numerator: rho_str_today=%e, source_integral=%e.",
+                 rho_str_today,
+                 source_integral);
+
+      if (rho_str_initial_numerator <= 0.0) {
+        /* Robust fallback for scans:
+         * if the uncapped anchor back-propagation would force rho_str(a_ini) <= 0,
+         * keep rho_str strictly positive with a tiny fraction of today's anchor.
+         * This avoids hard failures while preserving solver stability. */
+        double rho_floor_today = fmax(rho_str_today * 1e-12, 1e-300);
+        if (pba->background_verbose > 0) {
+          printf(" -> DDDC-BEC WARNING: anchor back-propagation gives non-positive rho_str(a_ini)"
+                 " (numerator=%e, source_integral=%e, rho_str_today=%e)."
+                 " Using fallback numerator=%e.\n",
+                 rho_str_initial_numerator,
+                 source_integral,
+                 rho_str_today,
+                 rho_floor_today);
+        }
+        rho_str_initial_numerator = rho_floor_today;
+      }
+
+      pvecback_integration[pba->index_bi_rho_str] =
+        rho_str_initial_numerator / pow(a, 3);
+    }
 
     class_test(!isfinite(pvecback_integration[pba->index_bi_rho_str]),
                pba->error_message,
@@ -3559,10 +3504,11 @@ int background_dilation_factor(
 /**
  * Compute the DDDC observed redshift for a given scale factor.
  *
- * In DDDC, the observed redshift combines expansion and dilation:
- *   (1 + Z_obs) = (1/a) * D(a) / D(1)
- *
- * When a_rs = 0 (no dilation), this reduces to the standard z = 1/a - 1.
+ * In DDDC, the observed redshift uses a hybrid expansion/dilation mix:
+ *   z_exp = 1/a - 1
+ *   z_dil = 1/D_effective - 1
+ *   z_obs = (1 + sigma_redshift*z_exp)*(1 + (1-sigma_redshift)*z_dil) - 1
+ * with sigma_redshift in [0,1].
  *
  * @param pba    Input: pointer to background structure
  * @param a      Input: scale factor
@@ -3577,35 +3523,36 @@ int background_dddc_z_of_a(
                             ErrorMsg error_message
                             ) {
 
-  double D_a, D_today;
+  {
+    double D_a = 1.0;
+    double D_today = 1.0;
+    double D_effective = 1.0;
+    double z_exp = (1.0 / a) - 1.0;
+    double z_dil;
+    double z_total;
 
-  /* DDDC v4 BEC: telescope redshift decoupled from coordinate expansion.
-   * z_obs = 1/(a * Gamma_eff(a)) - 1, with Gamma_eff(a)=Gamma_raw(a)/Gamma_raw(1).
-   * This automatically routes through z_table to correct angular diameter
-   * distance (index_bg_ang_distance) and luminosity distance (index_bg_lum_distance). */
-  if (pba->has_dddc_bec == _TRUE_) {
-    double Gamma_eff = bec_gamma_eff(pba, a);
-    *z_obs = MAX(0., 1.0 / (a * fmax(Gamma_eff, 1e-10)) - 1.0);
-    return _SUCCESS_;
+    if (pba->has_dddc_bec == _TRUE_) {
+      double Gamma_eff = bec_gamma_eff(pba, a);
+      D_effective = fmax(Gamma_eff, 1e-10);
+    }
+    else if (pba->a_rs != 0. || pba->r_s != 0.) {
+      class_call(background_dilation_factor(pba, a, &D_a, error_message),
+                 error_message,
+                 error_message);
+
+      class_call(background_dilation_factor(pba, 1.0, &D_today, error_message),
+                 error_message,
+                 error_message);
+
+      D_effective = fmax(D_today / fmax(D_a, 1e-30), 1e-30);
+    }
+
+    z_dil = (1.0 / D_effective) - 1.0;
+    z_total = ((1.0 + pba->sigma_redshift * z_exp)
+               * (1.0 + (1.0 - pba->sigma_redshift) * z_dil)) - 1.0;
+
+    *z_obs = MAX(0., z_total);
   }
-
-  /* If no dilation is configured, fall back to standard relation.
-   * Check both a_rs (Exponential mode) and r_s (Interior Schwarzschild mode):
-   * dilation_mode defaults to 1 (Schwarzschild) but is inactive when r_s == 0. */
-  if (pba->a_rs == 0. && pba->r_s == 0.) {
-    *z_obs = MAX(0., 1./a - 1.);
-    return _SUCCESS_;
-  }
-
-  class_call(background_dilation_factor(pba, a, &D_a, error_message),
-             error_message,
-             error_message);
-
-  class_call(background_dilation_factor(pba, 1.0, &D_today, error_message),
-             error_message,
-             error_message);
-
-  *z_obs = MAX(0., (D_a / D_today) / a - 1.);
 
   return _SUCCESS_;
 }
@@ -3613,7 +3560,7 @@ int background_dddc_z_of_a(
 /**
  * Find the scale factor corresponding to a given DDDC observed redshift.
  *
- * Solves (1 + Z_obs) = (1/a) * D(a) / D(1) for a, using bisection.
+ * Solves background_dddc_z_of_a(pba,a) = z_obs for a, using bisection.
  *
  * The function f(a) = (1/a)*D(a)/D(1) is monotonically decreasing in a
  * (expansion dominates), so bisection is robust.
@@ -3637,10 +3584,10 @@ int background_dddc_a_of_z(
   int max_iter = 100;
   double tol = 1.e-12;
 
-  /* If no dilation is configured, fall back to standard relation.
-   * Mirror the guard in background_dddc_z_of_a: both a_rs and r_s must be
-   * zero to indicate no active dilation (a_rs alone misses Schwarzschild mode). */
-  if (pba->a_rs == 0. && pba->r_s == 0.) {
+  /* Fast analytic inverse exists only in pure FLRW mapping z=1/a-1. */
+  if (pba->a_rs == 0. && pba->r_s == 0. &&
+      pba->has_dddc_bec == _FALSE_ &&
+      fabs(pba->sigma_redshift - 1.0) < 1e-15) {
     *a = 1. / (1. + z_obs);
     return _SUCCESS_;
   }
@@ -3862,10 +3809,6 @@ int background_derivs(
     double P_rest_cap  = 1e5 * fmax(fabs(y[pba->index_bi_rho_str]), 1e-30);
     double P_restoring = fmin(P_rest_raw, P_rest_cap);
     dy[pba->index_bi_rho_str] = -3.0 * (y[pba->index_bi_rho_str] - P_restoring);
-    
-    if (a < 1e-12 || fabs(dy[pba->index_bi_rho_str]) > 1e10 || !isfinite(dy[pba->index_bi_rho_str])) {
-       // Just catching to see if this is the issue, though it shouldn't be.
-    }
   }
 
   if (pba->has_scf == _TRUE_) {
@@ -3887,7 +3830,24 @@ int background_derivs(
   }
   
   if (pba->has_dddc_bec == _TRUE_) {
-    int bec_anomaly = (!isfinite(dy[pba->index_bi_rho_str]) || fabs(dy[pba->index_bi_rho_str]) > 1e10) ? _TRUE_ : _FALSE_;
+    double rho_str_abs = fabs(y[pba->index_bi_rho_str]);
+    double dy_rho_str_abs = fabs(dy[pba->index_bi_rho_str]);
+    double rel_rate = dy_rho_str_abs / fmax(rho_str_abs, 1e-300);
+    int bec_anomaly = _FALSE_;
+
+    /* Early-time rho_str scales as a^-3, so |d rho_str / dln a| can be huge
+     * while still physically valid (~3*rho_str). Flag only numerical pathologies:
+     * non-finite values, near-overflow magnitudes, or absurd relative rates. */
+    if (!isfinite(H) ||
+        !isfinite(y[pba->index_bi_rho_str]) ||
+        !isfinite(dy[pba->index_bi_rho_str]) ||
+        !isfinite(rel_rate) ||
+        rho_str_abs > 1e290 ||
+        dy_rho_str_abs > 1e290 ||
+        rel_rate > 1e6) {
+      bec_anomaly = _TRUE_;
+    }
+
     background_bec_debug_log(a,
                              H,
                              y[pba->index_bi_rho_str],
